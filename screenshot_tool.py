@@ -1015,7 +1015,7 @@ class AboutPage(QWidget):
         intro.setStyleSheet("color: #4a5568; font-size: 14px;")
         author = QLabel("作者：乾颐堂（现任明教教主）")
         author.setStyleSheet("font-size: 16px; font-weight: 600; margin-top: 12px;")
-        version = QLabel("版本：1.0.1")
+        version = QLabel("版本：1.1.0")
         version.setStyleSheet("font-size: 14px; color: #5f6b7c;")
         contact = QLabel("反馈邮箱：collinsctk@qytang.com\n如有 Bug 或建议请邮件联系。")
         contact.setWordWrap(True)
@@ -1208,18 +1208,20 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def duplicate_marker(self):
-        if self._has_active_marker():
-            marker = dict(self.markers[self.selected_marker_index])
-            marker['pos'] = marker['pos'] + QPoint(12, 12)
-            self.markers.append(marker)
-            self.selected_marker_index = len(self.markers) - 1
-            self.dragging_marker_index = self.selected_marker_index
-            self.selected_rectangle_index = None
-            self.rect_drag_mode = None
-            self._set_hover_marker(None)
-            self.markers_flattened = False
-            self.update()
-            self.optionsUpdated.emit()
+        if not self._has_active_marker():
+            return False
+        marker = dict(self.markers[self.selected_marker_index])
+        marker['pos'] = marker['pos'] + QPoint(12, 12)
+        self.markers.append(marker)
+        self.selected_marker_index = len(self.markers) - 1
+        self.dragging_marker_index = self.selected_marker_index
+        self.selected_rectangle_index = None
+        self.rect_drag_mode = None
+        self._set_hover_marker(None)
+        self.markers_flattened = False
+        self.update()
+        self.optionsUpdated.emit()
+        return True
 
     def _has_active_rectangle(self):
         return (
@@ -1276,10 +1278,11 @@ class AnnotationCanvas(QWidget):
             self.optionsUpdated.emit()
 
     def duplicate_rectangle(self):
-        if self._has_active_rectangle():
-            info = dict(self.rectangles[self.selected_rectangle_index])
-            info['rect'] = info['rect'].translated(12, 12)
-            info['flattened'] = False
+        if not self._has_active_rectangle():
+            return False
+        info = dict(self.rectangles[self.selected_rectangle_index])
+        info['rect'] = info['rect'].translated(12, 12)
+        info['flattened'] = False
         self.rectangles.append(info)
         self.selected_rectangle_index = len(self.rectangles) - 1
         self.selected_marker_index = None
@@ -1288,6 +1291,15 @@ class AnnotationCanvas(QWidget):
         self.rectangles_flattened = False
         self.update()
         self.optionsUpdated.emit()
+        return True
+
+    def duplicate_active_shape(self):
+        kind = self.active_selection_kind()
+        if kind == "rectangle":
+            return self.duplicate_rectangle()
+        if kind == "marker":
+            return self.duplicate_marker()
+        return False
 
     def apply_style_defaults(self, marker_style, rect_style):
         if marker_style:
@@ -1791,15 +1803,16 @@ class AnnotationTab(QWidget):
             QToolBar#AnnotationToolbar {
                 border: none;
                 padding: 0;
-                margin-bottom: 6px;
+                margin-bottom: 2px;
             }
             QToolBar#AnnotationToolbar QToolButton {
-                border-radius: 14px;
-                padding: 6px 18px;
+                border-radius: 6px;
+                padding: 2px 10px;
                 font-weight: 600;
                 background: rgba(14,19,37,0.08);
                 color: #1b2130;
-                margin-right: 8px;
+                margin-right: 2px;
+                min-height: 24px;
             }
             QToolBar#AnnotationToolbar QToolButton#Tool_rect {
                 background: rgba(95,39,205,0.18);
@@ -1843,6 +1856,14 @@ class AnnotationTab(QWidget):
         delete_action = QAction("删除选中", self)
         delete_action.triggered.connect(self._delete_selected)
         toolbar.addAction(delete_action)
+
+        duplicate_action = QAction("复制当前", self)
+        duplicate_action.triggered.connect(self._duplicate_active_shape)
+        toolbar.addAction(duplicate_action)
+
+        flatten_action = QAction("平化", self)
+        flatten_action.triggered.connect(self.canvas.flatten_markers)
+        toolbar.addAction(flatten_action)
 
         save_action = QAction("保存标注图", self)
         save_action.triggered.connect(self.save_annotated_image)
@@ -1992,6 +2013,10 @@ class AnnotationTab(QWidget):
             action.setChecked(tool == active_tool)
             action.blockSignals(False)
 
+    def _duplicate_active_shape(self):
+        if not self.canvas.duplicate_active_shape():
+            QApplication.beep()
+
     def eventFilter(self, obj, event):
         viewport = getattr(self, "_scroll_area", None)
         viewport_widget = viewport.viewport() if viewport else None
@@ -2098,104 +2123,88 @@ class MarkerOptionsPanel(QFrame):
         self._apply_style()
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(14)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
 
         palette_layout = QHBoxLayout()
-        palette_layout.setSpacing(10)
+        palette_layout.setSpacing(4)
         palette_label = QLabel("经典颜色")
-        palette_label.setStyleSheet("color:#424a5f;font-weight:600;")
+        palette_label.setStyleSheet("color:#2b3245;font-weight:600;font-size:12px;")
         palette_layout.addWidget(palette_label)
         for hex_color in CLASSIC_COLORS:
             btn = QPushButton()
             btn.setProperty("class", "color-chip")
-            btn.setFixedSize(30, 30)
+            btn.setFixedSize(20, 20)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(f"background-color:{hex_color}; border-radius:12px; border:2px solid transparent;")
+            btn.setStyleSheet(f"background-color:{hex_color}; border-radius:6px; border:2px solid transparent;")
             btn.setProperty("selected", False)
             btn.clicked.connect(lambda _, c=QColor(hex_color): self._set_palette_color(c))
             self.palette_buttons.append((btn, QColor(hex_color)))
             palette_layout.addWidget(btn)
-        palette_layout.addStretch()
-        layout.addLayout(palette_layout)
+        row.addLayout(palette_layout, 0)
 
-        color_row = QHBoxLayout()
-        color_row.setSpacing(10)
-        color_label = QLabel("填充色")
+        options = QHBoxLayout()
+        options.setSpacing(6)
+
+        def add_label(text):
+            label = QLabel(text)
+            label.setStyleSheet("color:#1e2433;font-size:12px;")
+            options.addWidget(label)
+            return label
+
+        add_label("填充色")
         self.color_btn = QPushButton()
-        self.color_btn.setFixedSize(82, 30)
+        self.color_btn.setFixedSize(64, 22)
         self.color_btn.setCursor(Qt.PointingHandCursor)
         self.color_btn.clicked.connect(self._choose_color)
+        options.addWidget(self.color_btn)
 
-        border_label = QLabel("描边色")
+        add_label("描边色")
         self.border_color_btn = QPushButton()
-        self.border_color_btn.setFixedSize(82, 30)
+        self.border_color_btn.setFixedSize(64, 22)
         self.border_color_btn.setCursor(Qt.PointingHandCursor)
         self.border_color_btn.clicked.connect(self._choose_border_color)
+        options.addWidget(self.border_color_btn)
 
-        self.border_checkbox = QCheckBox("启用描边")
+        self.border_checkbox = QCheckBox("描边")
+        self.border_checkbox.setStyleSheet("color:#1c263b;font-size:12px;")
         self.border_checkbox.toggled.connect(canvas.set_marker_border_enabled)
+        options.addWidget(self.border_checkbox)
 
-        color_row.addWidget(color_label)
-        color_row.addWidget(self.color_btn)
-        color_row.addSpacing(12)
-        color_row.addWidget(border_label)
-        color_row.addWidget(self.border_color_btn)
-        self.border_checkbox.setStyleSheet("color:#1c263b;")
-        color_row.addWidget(self.border_checkbox)
-        color_row.addStretch()
-        layout.addLayout(color_row)
-
-        controls = QHBoxLayout()
-        controls.setSpacing(10)
-        size_label = QLabel("大小")
+        add_label("大小")
         self.size_spin = QSpinBox()
         self.size_spin.setRange(10, 120)
+        self.size_spin.setFixedWidth(52)
         self.size_spin.valueChanged.connect(canvas.set_marker_size)
+        options.addWidget(self.size_spin)
 
-        ratio_label = QLabel("字号比例")
+        add_label("字号")
         self.font_ratio_spin = QDoubleSpinBox()
         self.font_ratio_spin.setRange(0.3, 1.2)
         self.font_ratio_spin.setSingleStep(0.05)
+        self.font_ratio_spin.setFixedWidth(64)
         self.font_ratio_spin.valueChanged.connect(canvas.set_marker_font_ratio)
+        options.addWidget(self.font_ratio_spin)
 
-        current_label = QLabel("当前序号")
+        add_label("当前")
         self.current_number_spin = QSpinBox()
         self.current_number_spin.setRange(1, 999)
+        self.current_number_spin.setFixedWidth(52)
         self.current_number_spin.valueChanged.connect(canvas.set_current_marker_number)
+        options.addWidget(self.current_number_spin)
 
-        next_label = QLabel("下一个序号")
+        add_label("下一个")
         self.number_spin = QSpinBox()
         self.number_spin.setRange(1, 999)
+        self.number_spin.setFixedWidth(52)
         self.number_spin.valueChanged.connect(canvas.set_next_marker_number)
-
-        controls.addWidget(size_label)
-        controls.addWidget(self.size_spin)
-        controls.addSpacing(8)
-        controls.addWidget(ratio_label)
-        controls.addWidget(self.font_ratio_spin)
-        controls.addSpacing(8)
-        controls.addWidget(current_label)
-        controls.addWidget(self.current_number_spin)
-        controls.addSpacing(8)
-        controls.addWidget(next_label)
-        controls.addWidget(self.number_spin)
-        controls.addStretch()
-        layout.addLayout(controls)
-
-        actions_row = QHBoxLayout()
-        actions_row.addStretch()
-        duplicate_btn = QPushButton("复制")
-        duplicate_btn.setProperty("class", "option-chip")
-        duplicate_btn.setCursor(Qt.PointingHandCursor)
-        duplicate_btn.clicked.connect(canvas.duplicate_marker)
-        flatten_btn = QPushButton("平化")
-        flatten_btn.setProperty("class", "option-chip")
-        flatten_btn.setCursor(Qt.PointingHandCursor)
-        flatten_btn.clicked.connect(canvas.flatten_markers)
-        actions_row.addWidget(duplicate_btn)
-        actions_row.addWidget(flatten_btn)
-        layout.addLayout(actions_row)
+        options.addWidget(self.number_spin)
+        options.addStretch()
+        row.addLayout(options, 1)
+        layout.addLayout(row)
 
         self.setLayout(layout)
         self.canvas.optionsUpdated.connect(self.sync_from_canvas)
@@ -2210,23 +2219,22 @@ class MarkerOptionsPanel(QFrame):
             f"""
             QFrame#MarkerPanel {{
                 background-color: {soft};
-                border-radius: 20px;
+                border-radius: 6px;
                 border: none;
             }}
             QFrame#MarkerPanel[active="true"] {{
                 background-color: {strong};
             }}
             QPushButton[class="option-chip"] {{
-                padding: 6px 18px;
-                border-radius: 14px;
+                padding: 2px 12px;
+                border-radius: 6px;
                 border: none;
                 background: {button_bg};
                 font-weight: 600;
                 color: #ffffff;
             }}
             QPushButton[class="color-chip"] {{
-                border-radius: 12px;
-                border: 2px solid transparent;
+                border-radius: 6px;
             }}
             QPushButton[class="color-chip"][selected="true"] {{
                 border-color: {accent};
@@ -2246,7 +2254,7 @@ class MarkerOptionsPanel(QFrame):
     def _update_color_button(self):
         color = self.canvas.marker_fill_color
         self.color_btn.setStyleSheet(
-            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; border-radius:10px;"
+            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; border-radius:6px;"
         )
 
     def _choose_color(self):
@@ -2270,7 +2278,7 @@ class MarkerOptionsPanel(QFrame):
     def _update_border_button(self):
         color = self.canvas.marker_border_color
         self.border_color_btn.setStyleSheet(
-            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; border-radius:10px;"
+            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; border-radius:6px;"
         )
 
     def _refresh_palette_highlight(self):
@@ -2320,78 +2328,73 @@ class RectangleOptionsPanel(QFrame):
         self._apply_style()
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(14)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
 
         palette_layout = QHBoxLayout()
-        palette_layout.setSpacing(10)
+        palette_layout.setSpacing(4)
         palette_label = QLabel("经典颜色")
-        palette_label.setStyleSheet("color:#424a5f;font-weight:600;")
+        palette_label.setStyleSheet("color:#2b3245;font-weight:600;font-size:12px;")
         palette_layout.addWidget(palette_label)
         for hex_color in CLASSIC_COLORS:
             btn = QPushButton()
             btn.setProperty("class", "color-chip")
-            btn.setFixedSize(30, 30)
+            btn.setFixedSize(20, 20)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(f"background-color:{hex_color}; border-radius:12px; border:2px solid transparent;")
+            btn.setStyleSheet(f"background-color:{hex_color}; border-radius:6px; border:2px solid transparent;")
             btn.clicked.connect(lambda _, c=QColor(hex_color): self._apply_palette_color(c))
             self.palette_buttons.append((btn, QColor(hex_color)))
             palette_layout.addWidget(btn)
-        palette_layout.addStretch()
-        layout.addLayout(palette_layout)
+        row.addLayout(palette_layout, 0)
 
-        action_row = QHBoxLayout()
-        action_row.setSpacing(10)
-        border_label = QLabel("描边色")
+        options = QHBoxLayout()
+        options.setSpacing(6)
+
+        def add_label(text):
+            label = QLabel(text)
+            label.setStyleSheet("color:#1e2433;font-size:12px;")
+            options.addWidget(label)
+            return label
+
+        add_label("描边色")
         self.color_btn = QPushButton()
-        self.color_btn.setFixedSize(90, 30)
+        self.color_btn.setFixedSize(74, 22)
         self.color_btn.setCursor(Qt.PointingHandCursor)
         self.color_btn.clicked.connect(self._choose_color)
-        action_row.addWidget(border_label)
-        action_row.addWidget(self.color_btn)
+        options.addWidget(self.color_btn)
 
-        width_label = QLabel("线宽")
+        add_label("线宽")
         self.width_spin = QSpinBox()
         self.width_spin.setRange(1, 20)
+        self.width_spin.setFixedWidth(52)
         self.width_spin.valueChanged.connect(canvas.set_rectangle_border_width)
-        action_row.addSpacing(10)
-        action_row.addWidget(width_label)
-        action_row.addWidget(self.width_spin)
+        options.addWidget(self.width_spin)
 
-        radius_label = QLabel("圆角")
+        add_label("圆角")
         self.radius_spin = QSpinBox()
         self.radius_spin.setRange(0, 60)
+        self.radius_spin.setFixedWidth(52)
         self.radius_spin.valueChanged.connect(canvas.set_rectangle_corner_radius)
-        action_row.addSpacing(10)
-        action_row.addWidget(radius_label)
-        action_row.addWidget(self.radius_spin)
+        options.addWidget(self.radius_spin)
 
-        action_row.addStretch()
-        layout.addLayout(action_row)
-
-        preset_row = QHBoxLayout()
-        preset_row.setSpacing(10)
         self.square_btn = QPushButton("直角")
         self.square_btn.setProperty("class", "option-chip")
         self.square_btn.setCursor(Qt.PointingHandCursor)
         self.square_btn.clicked.connect(lambda: self._set_radius_preset(0))
+        options.addWidget(self.square_btn)
+
         self.round_btn = QPushButton("圆角 8")
         self.round_btn.setProperty("class", "option-chip")
         self.round_btn.setCursor(Qt.PointingHandCursor)
         self.round_btn.clicked.connect(lambda: self._set_radius_preset(8))
-        preset_row.addWidget(self.square_btn)
-        preset_row.addWidget(self.round_btn)
-        preset_row.addStretch()
-        layout.addLayout(preset_row)
+        options.addWidget(self.round_btn)
 
-        actions_row = QHBoxLayout()
-        actions_row.addStretch()
-        self.duplicate_btn = QPushButton("复制")
-        self.duplicate_btn.setProperty("class", "option-chip")
-        self.duplicate_btn.setCursor(Qt.PointingHandCursor)
-        self.duplicate_btn.clicked.connect(canvas.duplicate_rectangle)
-        actions_row.addWidget(self.duplicate_btn)
-        layout.addLayout(actions_row)
+        options.addStretch()
+        row.addLayout(options, 1)
+        layout.addLayout(row)
 
         self.setLayout(layout)
         self.canvas.optionsUpdated.connect(self.sync_from_canvas)
@@ -2406,23 +2409,22 @@ class RectangleOptionsPanel(QFrame):
             f"""
             QFrame#RectanglePanel {{
                 background-color: {soft};
-                border-radius: 20px;
+                border-radius: 6px;
                 border: none;
             }}
             QFrame#RectanglePanel[active="true"] {{
                 background-color: {strong};
             }}
             QPushButton[class="option-chip"] {{
-                padding: 6px 18px;
-                border-radius: 14px;
+                padding: 2px 12px;
+                border-radius: 6px;
                 border: none;
                 background: {button_bg};
                 font-weight: 600;
                 color: #ffffff;
             }}
             QPushButton[class="color-chip"] {{
-                border-radius: 12px;
-                border: 2px solid transparent;
+                border-radius: 6px;
             }}
             QPushButton[class="color-chip"][selected="true"] {{
                 border-color: {accent};
@@ -2458,7 +2460,7 @@ class RectangleOptionsPanel(QFrame):
     def sync_from_canvas(self):
         color = self.canvas.rectangle_border_color
         self.color_btn.setStyleSheet(
-            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; padding: 6px; border-radius:10px;"
+            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; padding: 4px; border-radius:6px;"
         )
         self.width_spin.blockSignals(True)
         self.width_spin.setValue(self.canvas.rectangle_border_width)
@@ -2466,7 +2468,6 @@ class RectangleOptionsPanel(QFrame):
         self.radius_spin.blockSignals(True)
         self.radius_spin.setValue(self.canvas.rectangle_corner_radius)
         self.radius_spin.blockSignals(False)
-        self.duplicate_btn.setEnabled(self.canvas._has_active_rectangle())
         self._refresh_palette_highlight()
 
     def _set_radius_preset(self, value: int):
@@ -2941,8 +2942,8 @@ class ScreenSnapApp(QMainWindow):
         if not hasattr(self, "nav_toolbar"):
             return
         base = [
-            "QToolBar#PrimaryNav { background: #050a1c; border: none; padding: 10px 18px; }",
-            "QToolBar#PrimaryNav QToolButton { border-radius: 18px; padding: 6px 22px; font-weight:600; margin-right: 10px; color: #f7f8ff; background: rgba(255,255,255,0.08); }",
+            "QToolBar#PrimaryNav { background: #050a1c; border: none; padding: 8px 14px; }",
+            "QToolBar#PrimaryNav QToolButton { border-radius: 6px; padding: 4px 14px; font-weight:600; margin-right: 6px; color: #f7f8ff; background: rgba(255,255,255,0.08); }",
             "QToolBar#PrimaryNav QToolButton:checked { color: #0a101d; }",
         ]
         for key, accent in getattr(self, "nav_color_map", {}).items():
@@ -2997,7 +2998,7 @@ class ScreenSnapApp(QMainWindow):
     def _start_overlay_capture(self):
         screens = QGuiApplication.screens()
         if not screens:
-            QMessageBox.critical(self, "����", "�Ҳ�����Ļ�豸���޷���ͼ��")
+            QMessageBox.critical(self, "错误", "未找到可用的屏幕设备，无法截图。")
             self.show()
             return
         self._clear_overlays()
@@ -3145,7 +3146,7 @@ class ScreenSnapApp(QMainWindow):
 
     def _repeat_capture(self):
         if not self._last_selection_rect:
-            QMessageBox.information(self, "�ظ���ͼ", "����ִ��һ�������ͼ������ʹ���ظ���ͼ�ȼ���")
+            QMessageBox.information(self, "重复截图", "请先进行一次截图，随后才能使用重复截图功能。")
             return
         self.hide()
         QTimer.singleShot(200, self._do_repeat_capture)
@@ -3154,12 +3155,12 @@ class ScreenSnapApp(QMainWindow):
         target_screen = self._screen_by_name(self._last_capture_screen_name) or self._screen_for_cursor()
         screen = target_screen or QGuiApplication.primaryScreen()
         if not screen:
-            QMessageBox.critical(self, "����", "�Ҳ�����Ļ�豸���޷���ͼ��")
+            QMessageBox.critical(self, "错误", "未找到可用的屏幕设备，无法截图。")
             self.show()
             return
         rect = QRect(self._last_selection_rect)
         if rect.width() < 5 or rect.height() < 5:
-            QMessageBox.warning(self, "�ظ���ͼʧ��", "��¼������ߴ���Ч�������½�ͼ��")
+            QMessageBox.warning(self, "重复截图失败", "上次的截图区域无效，请重新截取。")
             self.show()
             return
         screenshot = self._grab_screen_pixmap(screen)
@@ -3193,14 +3194,37 @@ class ScreenSnapApp(QMainWindow):
         super().closeEvent(event)
 
     def _handle_unsaved_before_exit(self):
-        if not self.workspace_page.has_unsaved_tabs():
+        dirty_tabs = self.workspace_page.get_dirty_tabs()
+        has_dirty = bool(dirty_tabs)
+        return self._prompt_exit_decision(has_dirty)
+
+    def _prompt_exit_decision(self, has_dirty):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning if has_dirty else QMessageBox.Question)
+        box.setWindowTitle("退出确认")
+        if has_dirty:
+            box.setText("检测到存在未保存的图片，退出前请选择操作。")
+        else:
+            box.setText("当前图片已保存，仍然要退出吗？")
+        save_btn = box.addButton("保存全部后退出", QMessageBox.AcceptRole)
+        discard_btn = box.addButton("不保存直接退出", QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+        default_policy = self.exit_unsaved_policy
+        if default_policy == "save_all":
+            box.setDefaultButton(save_btn)
+        elif default_policy == "discard_all":
+            box.setDefaultButton(discard_btn)
+        else:
+            box.setDefaultButton(cancel_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == save_btn:
+            if has_dirty:
+                return self.workspace_page.save_all_dirty()
             return True
-        policy = self.exit_unsaved_policy
-        if policy == "save_all":
-            return self.workspace_page.save_all_dirty()
-        if policy == "discard_all":
+        if clicked == discard_btn:
             return True
-        return self.workspace_page.maybe_close_all()
+        return False
 
     def _resize_for_image(self, image_size: QSize):
         return
