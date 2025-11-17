@@ -16,7 +16,7 @@
     "border_enabled": true,
     "size": 28,
     "font_ratio": 1.2,
-    "next_number": 1
+    "next_number": 6
   },
   "rectangle_style": {
     "fill": "#00000000",
