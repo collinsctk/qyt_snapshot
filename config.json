@@ -1,5 +1,5 @@
 {
-  "save_dir": "C:/Users/ThinkPad/Documents/PicPick",
+  "save_dir": "",
   "hotkeys": {
     "capture": {
       "display": "Ctrl+Shift+Z",
@@ -16,7 +16,7 @@
     "border_enabled": true,
     "size": 28,
     "font_ratio": 1.2,
-    "next_number": 4
+    "next_number": 1
   },
   "rectangle_style": {
     "fill": "#00000000",
@@ -26,9 +26,9 @@
     "radius": 0
   },
   "image_quality": 70,
-  "auto_save_enabled": true,
-  "auto_start_enabled": true,
+  "auto_save_enabled": false,
+  "auto_start_enabled": false,
   "close_behavior": "tray",
   "exit_unsaved_policy": "save_all",
-  "workspace_zoom": 0.38554328942953137
+  "workspace_zoom": 1.0
 }

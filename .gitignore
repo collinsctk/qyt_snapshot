@@ -1,6 +1,6 @@
 screenshots/
 screenshot/
-config.json
+user.json
 
 # Python
 __pycache__/

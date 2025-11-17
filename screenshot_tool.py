@@ -1,5 +1,7 @@
 ﻿import ctypes
+import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 import sys
@@ -55,6 +57,7 @@ from PyQt5.QtWidgets import (
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+USER_CONFIG_FILE = os.path.join(BASE_DIR, "user.json")
 DEFAULT_SAVE_DIR = os.path.join(BASE_DIR, "screenshots")
 ICON_PATH = os.path.join(BASE_DIR, "favicon", "favicon.ico")
 _APP_ICON = None
@@ -91,11 +94,80 @@ DEFAULT_RECT_STYLE = {
 }
 
 DEFAULT_IMAGE_QUALITY = 95
+WAIT_OBJECT_0 = 0x00000000
+WAIT_ABANDONED = 0x00000080
+WAIT_TIMEOUT = 0x00000102
+ERROR_ALREADY_EXISTS = 183
+KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+USER32 = ctypes.WinDLL("user32", use_last_error=True)
+KERNEL32.CreateMutexW.restype = wintypes.HANDLE
+KERNEL32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+KERNEL32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+KERNEL32.ReleaseMutex.restype = wintypes.BOOL
+KERNEL32.CloseHandle.argtypes = (wintypes.HANDLE,)
+KERNEL32.CloseHandle.restype = wintypes.BOOL
 
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
+def _build_mutex_name():
+    exe_path = os.path.abspath(sys.argv[0] if sys.argv else __file__)
+    digest = hashlib.sha1(exe_path.encode("utf-8")).hexdigest()
+    return f"Local\\CTKSnapshot_{digest}"
+
+
+class SingleInstanceGuard:
+    def __init__(self):
+        self._name = _build_mutex_name()
+        self._handle = None
+        self.already_running = False
+        self._owns_mutex = False
+        self._acquire()
+
+    def _acquire(self):
+        ctypes.set_last_error(0)
+        handle = KERNEL32.CreateMutexW(None, False, self._name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle = handle
+        wait_result = KERNEL32.WaitForSingleObject(self._handle, 0)
+        if wait_result in (WAIT_OBJECT_0, WAIT_ABANDONED):
+            self._owns_mutex = True
+            self.already_running = False
+        elif wait_result == WAIT_TIMEOUT:
+            self.already_running = True
+            self._owns_mutex = False
+            KERNEL32.CloseHandle(self._handle)
+            self._handle = None
+        else:
+            raise ctypes.WinError(ctypes.get_last_error() or 0)
+
+    def release(self):
+        if not self._handle:
+            return
+        if self._owns_mutex:
+            KERNEL32.ReleaseMutex(self._handle)
+        KERNEL32.CloseHandle(self._handle)
+        self._handle = None
+
+    def __del__(self):
+        self.release()
+
+
+def _notify_instance_running():
+    flags = 0x00000030 | 0x00001000 | 0x00010000 | 0x00040000
+    try:
+        USER32.MessageBoxW(
+            None,
+            "程序不能多实例打开，本次启动已退出。",
+            "CTK Snapshot",
+            flags,
+        )
+    except Exception:
+        print("程序不能多实例打开，本次启动已退出。", file=sys.stderr)
+
+
+def _load_json_file(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
             try:
                 return json.load(handle)
             except json.JSONDecodeError:
@@ -103,8 +175,19 @@ def load_config():
     return {}
 
 
+def load_config():
+    defaults = _load_json_file(CONFIG_FILE)
+    overrides = _load_json_file(USER_CONFIG_FILE)
+    config = {}
+    if isinstance(defaults, dict):
+        config.update(defaults)
+    if isinstance(overrides, dict):
+        config.update(overrides)
+    return config
+
+
 def save_config(data):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
+    with open(USER_CONFIG_FILE, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, ensure_ascii=False)
 
 
@@ -827,7 +910,7 @@ class SettingsDialog(QDialog):
         self._quality_value = int(config.get("image_quality", DEFAULT_IMAGE_QUALITY))
         self._general_settings = {
             "auto_save_enabled": config.get("auto_save_enabled", False),
-            "save_dir": config.get("save_dir", DEFAULT_SAVE_DIR),
+            "save_dir": config.get("save_dir", ""),
             "auto_start_enabled": config.get("auto_start_enabled", False),
             "close_behavior": config.get("close_behavior", "tray"),
             "exit_unsaved_policy": config.get("exit_unsaved_policy", "save_all"),
@@ -2834,15 +2917,6 @@ class ScreenSnapApp(QMainWindow):
             self.exit_unsaved_policy = "save_all"
         self.marker_style = self.config.get("marker_style", DEFAULT_MARKER_STYLE.copy())
         self.rectangle_style = self.config.get("rectangle_style", DEFAULT_RECT_STYLE.copy())
-        self.config.setdefault("marker_style", self.marker_style)
-        self.config.setdefault("rectangle_style", self.rectangle_style)
-        self.config.setdefault("image_quality", self._image_quality)
-        self.config.setdefault("auto_save_enabled", self.auto_save_enabled)
-        self.config.setdefault("auto_start_enabled", self.auto_start_enabled)
-        self.config.setdefault("workspace_zoom", self.workspace_zoom)
-        self.config.setdefault("close_behavior", self.close_behavior)
-        self.config.setdefault("exit_unsaved_policy", self.exit_unsaved_policy)
-        save_config(self.config)
 
         self.workspace_page = AnnotationWorkspacePage(
             lambda: self._open_settings_dialog(),
@@ -2856,7 +2930,7 @@ class ScreenSnapApp(QMainWindow):
         )
         self._hotkey_manager = GlobalHotkeyManager(self)
         self._last_selection_rect = None
-        self._save_dir = self.config.get("save_dir", DEFAULT_SAVE_DIR)
+        self._save_dir = (self.config.get("save_dir") or "").strip()
         self._force_exit_once = False
 
         main_widget = QWidget()
@@ -2955,16 +3029,21 @@ class ScreenSnapApp(QMainWindow):
         base.append("QToolBar#PrimaryNav QToolButton#Nav_exit:hover { background: rgba(255,255,255,0.15); }")
         self.nav_toolbar.setStyleSheet("".join(base))
 
+    def _resolved_save_dir(self):
+        return self._save_dir or DEFAULT_SAVE_DIR
+
     def _open_save_folder(self):
-        os.makedirs(self._save_dir, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(self._save_dir))
+        target_dir = self._resolved_save_dir()
+        os.makedirs(target_dir, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(target_dir))
 
     def _open_workspace(self):
         self._switch_page("edit")
 
     def _open_images_dialog(self):
         filters = "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;所有文件 (*)"
-        files, _ = QFileDialog.getOpenFileNames(self, "选择图片文件", self._save_dir, filters)
+        initial_dir = self._resolved_save_dir()
+        files, _ = QFileDialog.getOpenFileNames(self, "选择图片文件", initial_dir, filters)
         if not files:
             return
         self.workspace_page.open_image_files(files)
@@ -2987,10 +3066,11 @@ class ScreenSnapApp(QMainWindow):
         self.close()
 
     def initiate_capture(self):
-        save_dir = self._save_dir or DEFAULT_SAVE_DIR
+        save_dir = self._resolved_save_dir()
         os.makedirs(save_dir, exist_ok=True)
-        self.config["save_dir"] = save_dir
-        save_config(self.config)
+        if self._save_dir:
+            self.config["save_dir"] = self._save_dir
+            save_config(self.config)
 
         self.hide()
         QTimer.singleShot(200, self._start_overlay_capture)
@@ -3013,7 +3093,7 @@ class ScreenSnapApp(QMainWindow):
         self._clear_overlays()
         self._last_selection_rect = QRect(selection_rect)
         self._last_capture_screen_name = screen_name
-        self.workspace_page.add_capture(pixmap, self._save_dir, self.workspace_zoom)
+        self.workspace_page.add_capture(pixmap, self._resolved_save_dir(), self.workspace_zoom)
         self.home_page.set_repeat_enabled(True)
         self._focus_workspace()
         self._resize_for_image(pixmap.size())
@@ -3065,9 +3145,11 @@ class ScreenSnapApp(QMainWindow):
             self._image_quality = int(self.config["image_quality"])
             general_settings = dialog.get_general_settings()
             self.auto_save_enabled = bool(general_settings.get("auto_save_enabled", False))
-            new_dir = general_settings.get("save_dir") or self._save_dir
-            self._save_dir = new_dir
-            self.config["save_dir"] = new_dir
+            new_dir = general_settings.get("save_dir")
+            if new_dir is None:
+                new_dir = self._save_dir
+            self._save_dir = (new_dir or "").strip()
+            self.config["save_dir"] = self._save_dir
             self.config["auto_save_enabled"] = self.auto_save_enabled
             new_auto_start = bool(general_settings.get("auto_start_enabled", False))
             self.auto_start_enabled = new_auto_start
@@ -3165,7 +3247,7 @@ class ScreenSnapApp(QMainWindow):
             return
         screenshot = self._grab_screen_pixmap(screen)
         cropped = self._copy_from_pixmap(screenshot, rect, screen)
-        self.workspace_page.add_capture(cropped, self._save_dir, self.workspace_zoom)
+        self.workspace_page.add_capture(cropped, self._resolved_save_dir(), self.workspace_zoom)
         self._focus_workspace()
         self._resize_for_image(cropped.size())
         QApplication.clipboard().setPixmap(cropped)
@@ -3195,8 +3277,9 @@ class ScreenSnapApp(QMainWindow):
 
     def _handle_unsaved_before_exit(self):
         dirty_tabs = self.workspace_page.get_dirty_tabs()
-        has_dirty = bool(dirty_tabs)
-        return self._prompt_exit_decision(has_dirty)
+        if not dirty_tabs:
+            return True
+        return self._prompt_exit_decision(True)
 
     def _prompt_exit_decision(self, has_dirty):
         box = QMessageBox(self)
@@ -3387,6 +3470,11 @@ class ScreenSnapApp(QMainWindow):
 
 
 def main():
+    guard = SingleInstanceGuard()
+    if guard.already_running:
+        _notify_instance_running()
+        guard.release()
+        return
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     start_minimized = False
@@ -3402,7 +3490,10 @@ def main():
     window = ScreenSnapApp(start_minimized=start_minimized)
     if not start_minimized:
         window.show()
-    sys.exit(app.exec_())
+    try:
+        sys.exit(app.exec_())
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":
