@@ -3959,6 +3959,8 @@ def main():
             qt_args.append(arg)
     sys.argv = qt_args
     app = QApplication(qt_args)
+    font = QFont("Microsoft YaHei", 10, QFont.Light)
+    app.setFont(font)
     app.setWindowIcon(get_app_icon())
     window = ScreenSnapApp(start_minimized=start_minimized)
     if not start_minimized:
