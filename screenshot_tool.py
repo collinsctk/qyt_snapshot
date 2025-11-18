@@ -1,4 +1,4 @@
-﻿import ctypes
+import base64
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -9,7 +9,25 @@ import winreg
 from datetime import datetime
 from enum import Enum, auto
 
-from PyQt5.QtCore import QPoint, QRect, Qt, pyqtSignal, QTimer, QUrl, QSize, QEvent
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None
+
+from PyQt5.QtCore import (
+    QPoint,
+    QRect,
+    Qt,
+    pyqtSignal,
+    QTimer,
+    QUrl,
+    QSize,
+    QEvent,
+    QBuffer,
+    QByteArray,
+    QIODevice,
+    QThread,
+)
 from PyQt5.QtGui import (
     QColor,
     QGuiApplication,
@@ -52,6 +70,9 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QSystemTrayIcon,
     QMenu,
+    QPlainTextEdit,
+    QFormLayout,
+    QSplitter,
 )
 
 
@@ -94,6 +115,16 @@ DEFAULT_RECT_STYLE = {
 }
 
 DEFAULT_IMAGE_QUALITY = 95
+AI_TRANSLATION_PROMPT = (
+    "请识别这张截图里的所有文字（保留原始顺序、标点和空格），"
+    "然后将识别结果和翻译合并到 JSON："
+    "{\"original\": \"原文\", \"translation\": \"翻译\"}。"
+)
+DEFAULT_AI_SETTINGS = {
+    "base_url": "https://aihubmix.com/v1",
+    "api_key": "",
+    "model": "gpt-4.1-nano",
+}
 WAIT_OBJECT_0 = 0x00000000
 WAIT_ABANDONED = 0x00000080
 WAIT_TIMEOUT = 0x00000102
@@ -191,6 +222,214 @@ def save_config(data):
         json.dump(data, handle, indent=2, ensure_ascii=False)
 
 
+def _normalized_ai_settings(settings):
+    merged = dict(DEFAULT_AI_SETTINGS)
+    if isinstance(settings, dict):
+        for key in merged:
+            value = settings.get(key)
+            if value is None:
+                continue
+            merged[key] = str(value)
+    return merged
+
+
+def pixmap_to_png_bytes(pixmap: QPixmap) -> bytes:
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    if not pixmap.save(buffer, "PNG"):
+        raise ValueError("无法导出截图数据")
+    data = bytes(buffer.data())
+    buffer.close()
+    return data
+
+
+class AITranslationService:
+    def __init__(self, settings):
+        self.settings = _normalized_ai_settings(settings)
+        self._client = None
+
+    @staticmethod
+    def is_configured(settings) -> bool:
+        normalized = _normalized_ai_settings(settings or {})
+        return all(normalized.get(key, "").strip() for key in ("base_url", "api_key", "model"))
+
+    def _ensure_client(self):
+        if OpenAI is None:
+            raise RuntimeError("未安装 openai SDK，请先运行 pip install openai")
+        if not self.is_configured(self.settings):
+            raise ValueError("请先在系统设置中配置 AI 接口")
+        if self._client is None:
+            self._client = OpenAI(
+                api_key=self.settings["api_key"].strip(),
+                base_url=self.settings["base_url"].strip(),
+            )
+        return self._client
+
+    def translate_image(self, image_bytes: bytes, prompt=AI_TRANSLATION_PROMPT):
+        if not image_bytes:
+            raise ValueError("截图内容为空，无法识别")
+        client = self._ensure_client()
+        base64_image = base64.b64encode(image_bytes).decode("ascii")
+        request_input = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{base64_image}",
+                    },
+                ],
+            }
+        ]
+        response = client.responses.create(model=self.settings["model"].strip(), input=request_input)
+        text = self._extract_response_text(response)
+        original, translation = self._parse_translation(text)
+        if original and not translation:
+            translation = self._translate_recognized_text(original)
+        return original, translation, text
+
+    def _translate_recognized_text(self, text):
+        if not text:
+            return ""
+        client = self._ensure_client()
+        prompt = (
+            "下面是识别到的英文原文，请把它翻译为简洁流畅的中文：\n\n"
+            + text.strip()
+            + "\n\n只返回翻译文本。"
+        )
+        response = client.responses.create(
+            model=self.settings["model"].strip(),
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                    ],
+                }
+            ],
+        )
+        return (self._extract_response_text(response) or "").strip()
+
+    def _extract_response_text(self, response) -> str:
+        if response is None:
+            return ""
+        text = getattr(response, "output_text", None)
+        if text:
+            return text
+        for attr in ("text", "content"):
+            maybe = getattr(response, attr, None)
+            if isinstance(maybe, str):
+                return maybe
+        output = getattr(response, "output", None)
+        chunks = []
+        if isinstance(output, list):
+            for block in output:
+                block_content = getattr(block, "content", None)
+                if block_content is None and isinstance(block, dict):
+                    block_content = block.get("content")
+                if isinstance(block_content, list):
+                    for part in block_content:
+                        text_value = getattr(part, "text", None)
+                        if text_value is None and isinstance(part, dict):
+                            text_value = part.get("text")
+                        if isinstance(text_value, str):
+                            chunks.append(text_value)
+        if chunks:
+            return "\n".join(chunks)
+        return ""
+
+    def _parse_translation(self, text: str):
+        cleaned = (text or "").strip()
+        data = self._try_extract_json(cleaned)
+        if data:
+            original = self._clean_text(str(data.get("original") or data.get("text") or ""))
+            translation = self._clean_text(str(data.get("translation") or data.get("translated") or ""))
+            return original, translation
+        if "\n\n" in cleaned:
+            original, translation = cleaned.split("\n\n", 1)
+            return self._clean_text(original), self._clean_text(translation)
+        if cleaned:
+            return "", self._clean_text(cleaned)
+        return "", ""
+
+    def _try_extract_json(self, text):
+        if not text:
+            return None
+        candidates = []
+        if text.startswith("{") and text.endswith("}"):
+            candidates.append(text)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(text[start : end + 1])
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    @staticmethod
+    def _clean_text(value):
+        if not value:
+            return ""
+        cleaned = value.strip()
+        cleaned = cleaned.replace("\t", " ").replace("\r", " ")
+        cleaned = cleaned.replace("\ufffd", "")
+        cleaned = " ".join(part for part in cleaned.splitlines() if part)
+        return cleaned
+
+
+def build_ai_test_image_bytes():
+    pixmap = QPixmap(360, 160)
+    pixmap.fill(QColor("#f5f5f5"))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    font = QFont("Microsoft YaHei", 16)
+    painter.setFont(font)
+    painter.setPen(QPen(QColor("#222222"), 2))
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, "AI OCR TEST\n用于验证的示例图片")
+    painter.end()
+    return pixmap_to_png_bytes(pixmap)
+
+
+class AITestWorker(QThread):
+    finished = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, image_bytes: bytes, settings, parent=None):
+        super().__init__(parent)
+        self._image_bytes = image_bytes
+        self._settings = settings
+
+    def run(self):
+        try:
+            service = AITranslationService(self._settings)
+            service.translate_image(self._image_bytes)
+            self.finished.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AITranslationWorker(QThread):
+    completed = pyqtSignal(str, str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, image_bytes: bytes, settings, parent=None):
+        super().__init__(parent)
+        self._image_bytes = image_bytes
+        self._settings = settings
+
+    def run(self):
+        try:
+            service = AITranslationService(self._settings)
+            original, translation, _ = service.translate_image(self._image_bytes)
+            self.completed.emit(original, translation)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class Tool(Enum):
     NONE = auto()
     RECTANGLE = auto()
@@ -269,6 +508,7 @@ DISPLAY_NAME_OVERRIDES = {
 HOTKEY_ACTIONS = [
     ("capture", "区域截图"),
     ("repeat_capture", "重复截图"),
+    ("ai_translate", "AI 截图翻译"),
 ]
 
 WM_HOTKEY = 0x0312
@@ -792,92 +1032,6 @@ class QualitySettingsPage(QWidget):
 
         self._sync_controls(self._quality)
 
-    def _clamp_quality(self, value):
-        try:
-            value = int(value)
-        except (TypeError, ValueError):
-            value = DEFAULT_IMAGE_QUALITY
-        return max(10, min(100, value))
-
-    def _clamp_zoom(self, value):
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return 1.0
-        return max(0.25, min(2.0, value))
-
-    def _handle_tab_zoom(self, factor, source_tab=None):
-        if self._updating_zoom:
-            return
-        factor = self._clamp_zoom(factor)
-        if abs(factor - self._display_zoom) < 0.001:
-            return
-        self._updating_zoom = True
-        self._display_zoom = factor
-        for tab in self._iter_tabs():
-            if tab is source_tab:
-                continue
-            if hasattr(tab, "canvas"):
-                tab.canvas.set_zoom(factor)
-        if callable(self._zoom_callback):
-            self._zoom_callback(factor)
-        self._updating_zoom = False
-
-    def _clamp_zoom(self, value):
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return 1.0
-        return max(0.25, min(2.0, value))
-
-    def _handle_tab_zoom(self, factor, source_tab=None):
-        if self._updating_zoom:
-            return
-        factor = self._clamp_zoom(factor)
-        if abs(factor - self._display_zoom) < 0.001:
-            return
-        self._updating_zoom = True
-        self._display_zoom = factor
-        for tab in self._iter_tabs():
-            if tab is source_tab:
-                continue
-            if hasattr(tab, "canvas"):
-                tab.canvas.set_zoom(factor)
-        if callable(self._zoom_callback):
-            self._zoom_callback(factor)
-        self._updating_zoom = False
-
-    def _clamp_zoom(self, value):
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return 1.0
-        return max(0.25, min(2.0, value))
-
-    def _clamp_zoom(self, value):
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return 1.0
-        return max(0.25, min(2.0, value))
-
-    def _handle_tab_zoom(self, factor, source_tab=None):
-        if self._updating_zoom:
-            return
-        factor = self._clamp_zoom(factor)
-        if abs(factor - self._display_zoom) < 0.001:
-            return
-        self._updating_zoom = True
-        self._display_zoom = factor
-        for tab in self._iter_tabs():
-            if tab is source_tab:
-                continue
-            if hasattr(tab, "canvas"):
-                tab.canvas.set_zoom(factor)
-        if callable(self._zoom_callback):
-            self._zoom_callback(factor)
-        self._updating_zoom = False
-
     def _sync_controls(self, value):
         self.slider.blockSignals(True)
         self.spin.blockSignals(True)
@@ -900,6 +1054,14 @@ class QualitySettingsPage(QWidget):
     def get_quality(self):
         return self._quality
 
+    def _clamp_quality(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = DEFAULT_IMAGE_QUALITY
+        return max(10, min(100, value))
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent, config):
         super().__init__(parent)
@@ -908,6 +1070,7 @@ class SettingsDialog(QDialog):
         self.resize(900, 600)
         self._hotkey_result = config.get("hotkeys", {}).copy()
         self._quality_value = int(config.get("image_quality", DEFAULT_IMAGE_QUALITY))
+        self._ai_settings = _normalized_ai_settings(config.get("ai_settings", {}))
         self._general_settings = {
             "auto_save_enabled": config.get("auto_save_enabled", False),
             "save_dir": config.get("save_dir", ""),
@@ -926,6 +1089,7 @@ class SettingsDialog(QDialog):
         self.nav_list.addItem("常规")
         self.nav_list.addItem("快捷键")
         self.nav_list.addItem("质量")
+        self.nav_list.addItem("AI 设置")
         self.nav_list.setFixedWidth(170)
         self.nav_list.setStyleSheet(
             "QListWidget { border: 1px solid #e0e0e0; } "
@@ -949,9 +1113,11 @@ class SettingsDialog(QDialog):
         )
         self.hotkey_page = HotkeySettingsPage(config.get("hotkeys", {}))
         self.quality_page = QualitySettingsPage(self._quality_value)
+        self.ai_page = AISettingsPage(self._ai_settings)
         self.stack.addWidget(self.general_page)
         self.stack.addWidget(self.hotkey_page)
         self.stack.addWidget(self.quality_page)
+        self.stack.addWidget(self.ai_page)
         content_layout.addWidget(self.stack, 1)
 
         layout.addLayout(content_layout)
@@ -979,6 +1145,7 @@ class SettingsDialog(QDialog):
         self._general_settings = general_settings
         self._hotkey_result = self.hotkey_page.get_hotkeys()
         self._quality_value = self.quality_page.get_quality()
+        self._ai_settings = self.ai_page.get_settings()
         super().accept()
 
     def get_hotkeys(self):
@@ -990,6 +1157,223 @@ class SettingsDialog(QDialog):
     def get_general_settings(self):
         return self._general_settings
 
+    def get_ai_settings(self):
+        return self._ai_settings
+
+
+class AISettingsPage(QWidget):
+    def __init__(self, ai_settings, parent=None):
+        super().__init__(parent)
+        self._tester = None
+        self._settings = _normalized_ai_settings(ai_settings or {})
+        layout = QVBoxLayout()
+
+        title = QLabel("配置 AI 截图翻译能力")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(title)
+
+        desc = QLabel("在此输入供应商提供的 base_url、API Key 和模型名称，并可点击“测试”验证是否支持图片识别。")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #4a4a4a;")
+        layout.addWidget(desc)
+
+        form = QFormLayout()
+        self.base_url_edit = QLineEdit(self._settings.get("base_url", ""))
+        self.base_url_edit.setPlaceholderText("例如：https://aihubmix.com/v1")
+        form.addRow("Base URL", self.base_url_edit)
+
+        self.model_edit = QLineEdit(self._settings.get("model", ""))
+        self.model_edit.setPlaceholderText("例如：gpt-4.1-nano")
+        form.addRow("模型名称", self.model_edit)
+
+        api_row = QHBoxLayout()
+        self.api_key_edit = QLineEdit(self._settings.get("api_key", ""))
+        self.api_key_edit.setEchoMode(QLineEdit.Password)
+        api_row.addWidget(self.api_key_edit, 1)
+        self.show_key_checkbox = QCheckBox("显示")
+        self.show_key_checkbox.toggled.connect(self._toggle_api_key_visibility)
+        api_row.addWidget(self.show_key_checkbox)
+        form.addRow("API Key", api_row)
+        layout.addLayout(form)
+
+        self.test_button = QPushButton("测试图片识别")
+        self.test_button.clicked.connect(self._on_test_clicked)
+        layout.addWidget(self.test_button)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #5c6470;")
+        layout.addWidget(self.status_label)
+        layout.addStretch()
+        self.setLayout(layout)
+
+    def _toggle_api_key_visibility(self, checked):
+        self.api_key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+
+    def _set_testing_state(self, running, message=""):
+        self.test_button.setEnabled(not running)
+        self.base_url_edit.setEnabled(not running)
+        self.model_edit.setEnabled(not running)
+        self.api_key_edit.setEnabled(not running)
+        self.show_key_checkbox.setEnabled(not running)
+        self.status_label.setText(message)
+
+    def _cleanup_tester(self):
+        if self._tester:
+            self._tester.deleteLater()
+            self._tester = None
+
+    def _on_test_clicked(self):
+        settings = self.get_settings()
+        if not AITranslationService.is_configured(settings):
+            QMessageBox.warning(self, "缺少配置", "请先填写 Base URL、API Key 和模型名称。")
+            return
+        if OpenAI is None:
+            QMessageBox.warning(self, "缺少依赖", "未检测到 openai 包，请先运行 pip install openai。")
+            return
+        image_bytes = build_ai_test_image_bytes()
+        self._set_testing_state(True, "正在通过示例图片测试，请稍候...")
+        self._tester = AITestWorker(image_bytes, settings)
+        self._tester.finished.connect(self._on_test_success)
+        self._tester.failed.connect(self._on_test_failed)
+        self._tester.start()
+
+    def _on_test_success(self):
+        self._set_testing_state(False, "测试通过：已成功识别示例图片。")
+        self._cleanup_tester()
+
+    def _on_test_failed(self, message):
+        self._set_testing_state(False, f"测试失败：{message}")
+        self._cleanup_tester()
+
+    def get_settings(self):
+        return {
+            "base_url": self.base_url_edit.text().strip(),
+            "api_key": self.api_key_edit.text().strip(),
+            "model": self.model_edit.text().strip(),
+        }
+
+
+class TranslationTab(QWidget):
+    def __init__(self, tab_index):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        self.splitter = QSplitter(Qt.Vertical)
+        self.original_edit = QPlainTextEdit()
+        self.original_edit.setReadOnly(True)
+        self.original_edit.setPlaceholderText("等待识别原文...")
+        self.translation_edit = QPlainTextEdit()
+        self.translation_edit.setReadOnly(True)
+        self.translation_edit.setPlaceholderText("等待翻译结果...")
+        self.splitter.addWidget(self.original_edit)
+        self.splitter.addWidget(self.translation_edit)
+        layout.addWidget(self.splitter)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        self.copy_translation_btn = QPushButton("复制译文")
+        self.copy_translation_btn.setEnabled(False)
+        self.copy_translation_btn.clicked.connect(self._copy_translation)
+        self.copy_original_btn = QPushButton("复制原文")
+        self.copy_original_btn.setEnabled(False)
+        self.copy_original_btn.clicked.connect(self._copy_original)
+        self.copy_both_btn = QPushButton("复制原文+译文")
+        self.copy_both_btn.setEnabled(False)
+        self.copy_both_btn.clicked.connect(self._copy_combined)
+        button_row.addWidget(self.copy_translation_btn)
+        button_row.addWidget(self.copy_original_btn)
+        button_row.addWidget(self.copy_both_btn)
+        layout.addLayout(button_row)
+
+    def set_texts(self, original, translation):
+        self.original_edit.setPlainText(original or "(未识别到文字)")
+        self.translation_edit.setPlainText(translation or "(未获得翻译)")
+        has_original = bool(original)
+        has_translation = bool(translation)
+        self.copy_original_btn.setEnabled(has_original)
+        self.copy_translation_btn.setEnabled(has_translation)
+        self.copy_both_btn.setEnabled(has_original or has_translation)
+
+    def _copy_translation(self):
+        QApplication.clipboard().setText(self.translation_edit.toPlainText())
+
+    def _copy_original(self):
+        QApplication.clipboard().setText(self.original_edit.toPlainText())
+
+    def _copy_combined(self):
+        original = self.original_edit.toPlainText()
+        translation = self.translation_edit.toPlainText()
+        combined = original or ""
+        if translation:
+            combined = f"{original} [{translation}]"
+        QApplication.clipboard().setText(combined)
+
+
+class AITranslationPanel(QWidget):
+    translationCompleted = pyqtSignal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        header = QLabel("AI 截图翻译")
+        header.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(header)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("color: #5c6470;")
+        layout.addWidget(self.status_label)
+        self.setLayout(layout)
+        self._ai_settings = {}
+        self._tab_counter = 0
+        self._workers = []
+
+    def set_ai_settings(self, settings):
+        self._ai_settings = _normalized_ai_settings(settings or {})
+
+    def add_capture(self, pixmap: QPixmap):
+        if not AITranslationService.is_configured(self._ai_settings):
+            self.status_label.setText("请先在系统设置 -> AI 设置中填写 base_url/API Key/模型。")
+            return
+        try:
+            image_bytes = pixmap_to_png_bytes(pixmap)
+        except Exception as exc:
+            self.status_label.setText(f"图片处理失败：{exc}")
+            return
+        self._tab_counter += 1
+        tab = TranslationTab(self._tab_counter)
+        title = f"{self._tab_counter}. 识别中"
+        self.tabs.addTab(tab, title)
+        self.tabs.setCurrentWidget(tab)
+        self.status_label.setText("AI 正在识别并翻译截图...")
+        worker = AITranslationWorker(image_bytes, self._ai_settings)
+        worker.completed.connect(lambda original, translation, tab=tab: self._on_translation_success(tab, original, translation))
+        worker.failed.connect(lambda message, tab=tab: self._on_translation_failure(tab, message))
+        worker.finished.connect(lambda w=worker: self._cleanup_worker(w))
+        self._workers.append(worker)
+        worker.start()
+
+    def _on_translation_success(self, tab, original, translation):
+        tab.set_texts(original, translation)
+        idx = self.tabs.indexOf(tab)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.tabs.setTabText(idx, f"{idx + 1}. {timestamp}")
+        if translation:
+            QApplication.clipboard().setText(translation)
+            self.status_label.setText("识别完成，译文已复制到剪贴板。")
+        else:
+            self.status_label.setText("识别完成，请手动复制需要的内容。")
+        self.translationCompleted.emit()
+
+    def _on_translation_failure(self, tab, message):
+        idx = self.tabs.indexOf(tab)
+        if idx >= 0:
+            self.tabs.setTabText(idx, f"{idx + 1}. 失败")
+        self.status_label.setText(f"AI 识别失败：{message}")
+
+    def _cleanup_worker(self, worker):
+        if worker in self._workers:
+            self._workers.remove(worker)
+            worker.deleteLater()
 class ActionButton(QPushButton):
     def __init__(self, title, subtitle="", callback=None, enabled=True):
         super().__init__()
@@ -1012,6 +1396,7 @@ class HomePage(QWidget):
     openFolderRequested = pyqtSignal()
     captureRequested = pyqtSignal()
     repeatRequested = pyqtSignal()
+    aiTranslateRequested = pyqtSignal()
     openSettingsRequested = pyqtSignal()
     openWorkspaceRequested = pyqtSignal()
     openImagesRequested = pyqtSignal()
@@ -1043,6 +1428,8 @@ class HomePage(QWidget):
         capture_layout.addWidget(capture_label)
         capture_layout.addWidget(ActionButton("区域截图", "选择屏幕区域", self.captureRequested.emit))
         self.repeat_button = ActionButton("重复上次截取", "使用上一次选择的矩形区域", self.repeatRequested.emit, enabled=False)
+        self.ai_button = ActionButton("AI 截图翻译", "选取区域后AI自动识别并翻译", self.aiTranslateRequested.emit)
+        capture_layout.addWidget(self.ai_button)
         capture_layout.addWidget(self.repeat_button)
         capture_layout.addStretch()
         content_layout.addLayout(capture_layout, 1)
@@ -1069,6 +1456,9 @@ class HomePage(QWidget):
 
     def set_hotkey_summary(self, text):
         self.hotkey_summary_label.setText(text)
+
+    def set_ai_translate_enabled(self, enabled):
+        self.ai_button.setEnabled(enabled)
 
 
 class ComingSoonPage(QWidget):
@@ -2902,6 +3292,7 @@ class ScreenSnapApp(QMainWindow):
         self.setWindowIcon(get_app_icon())
         self._start_minimized = start_minimized
         self.config = load_config()
+        self.ai_settings = _normalized_ai_settings(self.config.get("ai_settings", {}))
         self._active_overlays = []
         self._last_capture_screen_name = None
         self.auto_save_enabled = bool(self.config.get("auto_save_enabled", False))
@@ -2932,6 +3323,7 @@ class ScreenSnapApp(QMainWindow):
         self._last_selection_rect = None
         self._save_dir = (self.config.get("save_dir") or "").strip()
         self._force_exit_once = False
+        self._pending_capture_handler = None
 
         main_widget = QWidget()
         root_layout = QVBoxLayout(main_widget)
@@ -2945,9 +3337,15 @@ class ScreenSnapApp(QMainWindow):
         self.nav_color_map = {
             "home": "#FF8BA7",
             "edit": "#2ED3A3",
+            "ai": "#2C7AFA",
             "about": "#BD93FF",
         }
-        for text, key in [("首页", "home"), ("图片编辑", "edit"), ("关于", "about")]:
+        for text, key in [
+            ("首页", "home"),
+            ("图片编辑", "edit"),
+            ("AI截图翻译", "ai"),
+            ("关于", "about"),
+        ]:
             action = QAction(text, self)
             action.setCheckable(True)
             action.triggered.connect(lambda _, k=key: self._switch_page(k))
@@ -2967,16 +3365,30 @@ class ScreenSnapApp(QMainWindow):
 
         self.pages = QStackedWidget()
         self.home_page = HomePage(self._save_dir)
+        self.edit_page = self.workspace_page
+        self.translation_panel = AITranslationPanel()
+        self.translation_panel.translationCompleted.connect(lambda: self._switch_page("ai"))
+        self.ai_page_widget = QWidget()
+        ai_layout = QVBoxLayout(self.ai_page_widget)
+        ai_layout.addWidget(self.translation_panel)
+        ai_layout.setContentsMargins(0, 0, 0, 0)
         self.pages.addWidget(self.home_page)
-        self.pages.addWidget(self.workspace_page)
+        self.pages.addWidget(self.edit_page)
+        self.pages.addWidget(self.ai_page_widget)
         self.about_page = AboutPage()
         self.pages.addWidget(self.about_page)
-        self._pages = {"home": self.home_page, "edit": self.workspace_page, "about": self.about_page}
+        self._pages = {
+            "home": self.home_page,
+            "edit": self.edit_page,
+            "ai": self.ai_page_widget,
+            "about": self.about_page,
+        }
         root_layout.addWidget(self.pages, 1)
 
         self.home_page.openFolderRequested.connect(self._open_save_folder)
         self.home_page.captureRequested.connect(self.initiate_capture)
         self.home_page.repeatRequested.connect(self._repeat_capture)
+        self.home_page.aiTranslateRequested.connect(self.start_ai_translation_capture)
         self.home_page.openImagesRequested.connect(self._open_images_dialog)
         self.home_page.openSettingsRequested.connect(self._open_settings_dialog)
         self.home_page.openWorkspaceRequested.connect(self._open_workspace)
@@ -2989,6 +3401,7 @@ class ScreenSnapApp(QMainWindow):
         self.home_page.set_repeat_enabled(False)
         self._register_all_hotkeys()
         self._update_hotkey_summary()
+        self._update_ai_feature_state()
         self.tray_icon = None
         self._tray_message_shown = False
         self._closing_via_tray_exit = False
@@ -2998,6 +3411,7 @@ class ScreenSnapApp(QMainWindow):
             QTimer.singleShot(0, self._minimize_to_tray)
         else:
             self.show()
+        self.translation_panel.set_ai_settings(self.ai_settings)
 
     def _switch_page(self, key):
         if key not in self._pages:
@@ -3051,6 +3465,9 @@ class ScreenSnapApp(QMainWindow):
 
     def _focus_workspace(self):
         self._switch_page("edit")
+        self._show_main_window()
+
+    def _show_main_window(self):
         if self.tray_icon and self.tray_icon.isVisible():
             self._restore_from_tray()
             return
@@ -3065,15 +3482,28 @@ class ScreenSnapApp(QMainWindow):
         self._force_exit_once = True
         self.close()
 
-    def initiate_capture(self):
+    def _prepare_save_dir(self):
         save_dir = self._resolved_save_dir()
         os.makedirs(save_dir, exist_ok=True)
         if self._save_dir:
             self.config["save_dir"] = self._save_dir
             save_config(self.config)
+        return save_dir
 
+    def _start_capture_session(self, handler):
+        self._pending_capture_handler = handler
         self.hide()
         QTimer.singleShot(200, self._start_overlay_capture)
+
+    def initiate_capture(self):
+        self._prepare_save_dir()
+        self._start_capture_session(self._handle_annotation_capture)
+
+    def start_ai_translation_capture(self):
+        if not self._ensure_ai_ready():
+            return
+        self._prepare_save_dir()
+        self._start_capture_session(self._handle_ai_translation_capture)
 
     def _start_overlay_capture(self):
         screens = QGuiApplication.screens()
@@ -3087,10 +3517,16 @@ class ScreenSnapApp(QMainWindow):
 
     def _on_capture_cancel(self):
         self._clear_overlays()
-        self.show()
+        self._pending_capture_handler = None
+        self._show_main_window()
 
     def _on_overlay_selection(self, pixmap: QPixmap, selection_rect: QRect, screen_name: str):
         self._clear_overlays()
+        handler = self._pending_capture_handler or self._handle_annotation_capture
+        self._pending_capture_handler = None
+        handler(pixmap, selection_rect, screen_name)
+
+    def _handle_annotation_capture(self, pixmap: QPixmap, selection_rect: QRect, screen_name: str):
         self._last_selection_rect = QRect(selection_rect)
         self._last_capture_screen_name = screen_name
         self.workspace_page.add_capture(pixmap, self._resolved_save_dir(), self.workspace_zoom)
@@ -3098,6 +3534,13 @@ class ScreenSnapApp(QMainWindow):
         self._focus_workspace()
         self._resize_for_image(pixmap.size())
         QApplication.clipboard().setPixmap(pixmap)
+
+    def _handle_ai_translation_capture(self, pixmap: QPixmap, selection_rect: QRect, screen_name: str):
+        self._last_selection_rect = QRect(selection_rect)
+        self._last_capture_screen_name = screen_name
+        self.home_page.set_repeat_enabled(True)
+        self._show_main_window()
+        self.translation_panel.add_capture(pixmap)
 
     def _hotkey_display_text(self, action_id):
         hotkey_info = self.config.get("hotkeys", {}).get(action_id, {})
@@ -3124,6 +3567,30 @@ class ScreenSnapApp(QMainWindow):
         if hasattr(self, "home_page"):
             self.home_page.set_hotkey_summary(summary_text)
 
+    def _ensure_ai_ready(self):
+        if not AITranslationService.is_configured(self.ai_settings):
+            self._prompt_configure_ai()
+            return False
+        if OpenAI is None:
+            QMessageBox.warning(self, "缺少依赖", "未安装 openai SDK，请先在命令行执行 pip install openai。")
+            return False
+        return True
+
+    def _prompt_configure_ai(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("AI 功能未配置")
+        box.setText("请先在“系统设置 -> AI 设置”中填入 base_url、API Key 和模型名称。")
+        settings_btn = box.addButton("打开设置", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() == settings_btn:
+            self._open_settings_dialog()
+
+    def _update_ai_feature_state(self):
+        enabled = AITranslationService.is_configured(self.ai_settings) and OpenAI is not None
+        if hasattr(self, "home_page"):
+            self.home_page.set_ai_translate_enabled(enabled)
+
 
     def _on_workspace_zoom_changed(self, factor):
         try:
@@ -3143,6 +3610,8 @@ class ScreenSnapApp(QMainWindow):
             self.config["hotkeys"] = dialog.get_hotkeys()
             self.config["image_quality"] = dialog.get_image_quality()
             self._image_quality = int(self.config["image_quality"])
+            self.ai_settings = _normalized_ai_settings(dialog.get_ai_settings())
+            self.config["ai_settings"] = self.ai_settings
             general_settings = dialog.get_general_settings()
             self.auto_save_enabled = bool(general_settings.get("auto_save_enabled", False))
             new_dir = general_settings.get("save_dir")
@@ -3168,6 +3637,8 @@ class ScreenSnapApp(QMainWindow):
             self._sync_autostart_entry()
             self._register_all_hotkeys()
             self._update_hotkey_summary()
+            self._update_ai_feature_state()
+            self.translation_panel.set_ai_settings(self.ai_settings)
 
     def _on_style_changed(self, style_type, data):
         if style_type == "marker":
@@ -3212,6 +3683,8 @@ class ScreenSnapApp(QMainWindow):
             self.initiate_capture()
         elif action_id == "repeat_capture":
             self._repeat_capture()
+        elif action_id == "ai_translate":
+            self.start_ai_translation_capture()
 
     def _on_hotkey_trigger(self, action_id):
         if self._active_overlays:
