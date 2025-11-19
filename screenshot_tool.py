@@ -36,6 +36,7 @@ from PyQt5.QtGui import (
     QPen,
     QPixmap,
     QFont,
+    QFontMetrics,
     QIcon,
     QDesktopServices,
     QKeySequence,
@@ -48,6 +49,8 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QLabel,
     QLineEdit,
+    QInputDialog,
+    QFontComboBox,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -97,6 +100,7 @@ CLASSIC_COLORS = [
 PANEL_ACCENTS = {
     "marker": "#1AAE7F",
     "rectangle": "#5F27CD",
+    "text": "#F7B500",
 }
 
 DEFAULT_MARKER_STYLE = {
@@ -113,6 +117,13 @@ DEFAULT_RECT_STYLE = {
     "border_enabled": True,
     "width": 3,
     "radius": 8,
+}
+
+DEFAULT_TEXT_STYLE = {
+    "color": "#1e2433",
+    "font": "Microsoft YaHei",
+    "size": 18,
+    "background": "transparent",
 }
 
 DEFAULT_IMAGE_QUALITY = 95
@@ -476,6 +487,7 @@ class Tool(Enum):
     NONE = auto()
     RECTANGLE = auto()
     MARKER = auto()
+    TEXT = auto()
 
 MODIFIER_ORDER = [
     (Qt.ControlModifier, "Ctrl"),
@@ -1607,6 +1619,16 @@ class AnnotationCanvas(QWidget):
         self.rect_drag_origin = QPoint()
         self.creating_new_rect = False
         self._marker_dragging = False
+        self._text_dragging = False
+        self._text_drag_index = None
+        self._text_drag_offset = QPoint()
+        self.text_items = []
+        self.text_color = QColor(DEFAULT_TEXT_STYLE["color"])
+        self.text_background_color = QColor(DEFAULT_TEXT_STYLE["background"])
+        self.text_font_family = DEFAULT_TEXT_STYLE["font"]
+        self.text_font_size = DEFAULT_TEXT_STYLE["size"]
+        self.owner_tab = None
+        self.selected_text_index = None
         self._apply_zoom()
 
     def zoom_factor(self):
@@ -1677,6 +1699,8 @@ class AnnotationCanvas(QWidget):
         self.selected_marker_index = None
         self.hover_marker_index = None
         self.selected_rectangle_index = None
+        self.text_items.clear()
+        self.selected_text_index = None
         self._reset_rect_drag()
         self._marker_dragging = False
         self.update()
@@ -1687,6 +1711,12 @@ class AnnotationCanvas(QWidget):
             self.selected_marker_index is not None
             and not self.markers_flattened
             and 0 <= self.selected_marker_index < len(self.markers)
+        )
+
+    def _has_active_text(self):
+        return (
+            self.selected_text_index is not None
+            and 0 <= self.selected_text_index < len(self.text_items)
         )
 
     def set_marker_color(self, color: QColor):
@@ -1838,7 +1868,7 @@ class AnnotationCanvas(QWidget):
             return self.duplicate_marker()
         return False
 
-    def apply_style_defaults(self, marker_style, rect_style):
+    def apply_style_defaults(self, marker_style, rect_style, text_style=None):
         if marker_style:
             self.marker_fill_color = QColor(marker_style.get("fill", DEFAULT_MARKER_STYLE["fill"]))
             self.marker_border_color = QColor(marker_style.get("border", DEFAULT_MARKER_STYLE["border"]))
@@ -1852,6 +1882,41 @@ class AnnotationCanvas(QWidget):
             self.rectangle_border_enabled = rect_style.get("border_enabled", DEFAULT_RECT_STYLE["border_enabled"])
             self.rectangle_border_width = rect_style.get("width", DEFAULT_RECT_STYLE["width"])
             self.rectangle_corner_radius = rect_style.get("radius", DEFAULT_RECT_STYLE["radius"])
+        if text_style:
+            self.apply_text_style_defaults(text_style)
+
+    def apply_text_style_defaults(self, text_style):
+        style = text_style or {}
+        color = QColor(style.get("color", DEFAULT_TEXT_STYLE["color"]))
+        background = QColor(style.get("background", DEFAULT_TEXT_STYLE["background"]))
+        font_family = style.get("font", DEFAULT_TEXT_STYLE["font"])
+        try:
+            size = int(style.get("size", DEFAULT_TEXT_STYLE["size"]))
+        except (TypeError, ValueError):
+            size = DEFAULT_TEXT_STYLE["size"]
+        self.text_color = color
+        self.text_background_color = background
+        self.text_font_family = font_family or DEFAULT_TEXT_STYLE["font"]
+        self.text_font_size = size
+        self.update()
+        self.optionsUpdated.emit()
+
+    def apply_text_style(self, style):
+        if not style:
+            return
+        color = QColor(style.get("color", self.text_color))
+        bg = QColor(style.get("background", self.text_background_color))
+        font_family = style.get("font", self.text_font_family)
+        try:
+            font_size = int(style.get("font_size", style.get("size", self.text_font_size)))
+        except (TypeError, ValueError):
+            font_size = self.text_font_size
+        self.text_color = color
+        self.text_background_color = bg
+        self.text_font_family = font_family
+        self.text_font_size = font_size
+        self.optionsUpdated.emit()
+        self.update()
 
     def marker_style_state(self):
         return {
@@ -1872,7 +1937,99 @@ class AnnotationCanvas(QWidget):
             "radius": self.rectangle_corner_radius,
         }
 
+    def set_text_color(self, color: QColor):
+        if not color or not color.isValid():
+            return
+        self.text_color = QColor(color)
+        if self._has_active_text():
+            self.text_items[self.selected_text_index]["color"] = QColor(color)
+        self.optionsUpdated.emit()
+        self.update()
+
+    def set_text_font_size(self, size: int):
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        clamped = max(8, min(72, size))
+        if abs(clamped - self.text_font_size) < 0.1:
+            return
+        self.text_font_size = clamped
+        if self._has_active_text():
+            self.text_items[self.selected_text_index]["font_size"] = clamped
+        self.optionsUpdated.emit()
+        self.update()
+
+    def set_text_font_family(self, family: str):
+        if not family:
+            return
+        self.text_font_family = family
+        if self._has_active_text():
+            self.text_items[self.selected_text_index]["font_family"] = family
+        self.optionsUpdated.emit()
+        self.update()
+
+    def set_text_background_color(self, color: QColor):
+        if not color or not color.isValid():
+            return
+        self.text_background_color = QColor(color)
+        if self._has_active_text():
+            self.text_items[self.selected_text_index]["background"] = QColor(color)
+        self.optionsUpdated.emit()
+        self.update()
+
+    def update_selected_text_color(self, color: QColor):
+        if not color or not color.isValid() or not self._has_active_text():
+            return
+        item = self.text_items[self.selected_text_index]
+        item["color"] = QColor(color)
+        self.text_color = QColor(color)
+        self.optionsUpdated.emit()
+        self.update()
+
+    def update_selected_text_background(self, color: QColor):
+        if not color or not color.isValid() or not self._has_active_text():
+            return
+        item = self.text_items[self.selected_text_index]
+        item["background"] = QColor(color)
+        self.text_background_color = QColor(color)
+        self.optionsUpdated.emit()
+        self.update()
+
+    def update_selected_text_font_family(self, family: str):
+        if not family or not self._has_active_text():
+            return
+        item = self.text_items[self.selected_text_index]
+        item["font_family"] = family
+        self.text_font_family = family
+        self.optionsUpdated.emit()
+        self.update()
+
+    def update_selected_text_font_size(self, size: int):
+        if not self._has_active_text():
+            return
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        size = max(8, min(72, size))
+        item = self.text_items[self.selected_text_index]
+        item["font_size"] = size
+        self.text_font_size = size
+        self.optionsUpdated.emit()
+        self.update()
+
+    def text_style_state(self):
+        return {
+            "color": self.text_color.name(QColor.HexArgb),
+            "font": self.text_font_family,
+            "size": self.text_font_size,
+            "background": self.text_background_color.name(QColor.HexArgb),
+        }
+
     def active_selection_kind(self):
+        if self._has_active_text():
+            return "text"
         if self._has_active_marker():
             return "marker"
         if self._has_active_rectangle():
@@ -1881,6 +2038,12 @@ class AnnotationCanvas(QWidget):
 
     def clear_active_selection(self, emit=True):
         changed = False
+        if self.selected_text_index is not None:
+            self.selected_text_index = None
+            changed = True
+            self._text_dragging = False
+            self._text_drag_index = None
+            self._text_drag_offset = QPoint()
         if self.selected_marker_index is not None:
             self.selected_marker_index = None
             self.dragging_marker_index = None
@@ -1900,10 +2063,17 @@ class AnnotationCanvas(QWidget):
             self._update_default_cursor()
             if emit:
                 self.optionsUpdated.emit()
+                self._notify_text_selection()
         self.update()
         return changed
 
     def delete_selected_shape(self):
+        if self._has_active_text():
+            self.text_items.pop(self.selected_text_index)
+            self.selected_text_index = None
+            self.optionsUpdated.emit()
+            self.update()
+            return True
         if self._has_active_marker():
             self.markers.pop(self.selected_marker_index)
             self.selected_marker_index = None
@@ -1937,6 +2107,12 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def undo_last_shape(self):
+        if self.text_items:
+            self.text_items.pop()
+            self.selected_text_index = None
+            self.update()
+            self.optionsUpdated.emit()
+            return True
         if self.markers and not self.markers_flattened:
             self.markers.pop()
             self.selected_marker_index = None
@@ -1964,13 +2140,22 @@ class AnnotationCanvas(QWidget):
         pos = self._view_to_scene(event.pos())
         if self._handle_rect_press(pos, allow_creation=False, handles_only=True):
             return
+        if self._handle_text_press(pos, allow_creation=self.tool == Tool.TEXT):
+            return
         if self._handle_marker_press(pos, allow_creation=self.tool == Tool.MARKER):
             return
         if self._handle_rect_press(pos, allow_creation=self.tool == Tool.RECTANGLE):
             return
+        self.clear_active_selection()
 
     def mouseMoveEvent(self, event):
         pos = self._view_to_scene(event.pos())
+        if self._text_dragging and self._text_drag_index is not None:
+            item = self.text_items[self._text_drag_index]
+            item["pos"] = QPoint(pos - self._text_drag_offset)
+            self.update()
+            self.optionsUpdated.emit()
+            return
         if self.dragging_marker_index is not None and not self.markers_flattened:
             self.markers[self.dragging_marker_index]['pos'] = pos
             self.update()
@@ -2010,7 +2195,17 @@ class AnnotationCanvas(QWidget):
                     self.update()
                     self.optionsUpdated.emit()
             self._reset_rect_drag()
+        if self._text_dragging:
+            self._end_text_drag()
         self._update_pointer_feedback(pos)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        pos = self._view_to_scene(event.pos())
+        idx = self._text_hit_test(pos)
+        if idx is not None:
+            self._edit_text(idx)
 
     def _handle_marker_press(self, pos: QPoint, allow_creation=True):
         idx = self._marker_hit_test(pos)
@@ -2018,6 +2213,7 @@ class AnnotationCanvas(QWidget):
             self.dragging_marker_index = idx
             self.selected_marker_index = idx
             self.selected_rectangle_index = None
+            self.selected_text_index = None
             self.rect_drag_mode = None
             self._set_hover_marker(None)
             self._begin_marker_drag()
@@ -2037,6 +2233,7 @@ class AnnotationCanvas(QWidget):
             self.markers.append(marker)
             self.selected_marker_index = len(self.markers) - 1
             self.selected_rectangle_index = None
+            self.selected_text_index = None
             self.dragging_marker_index = self.selected_marker_index
             self.rect_drag_mode = None
             self.markers_flattened = False
@@ -2048,6 +2245,71 @@ class AnnotationCanvas(QWidget):
             return True
         return False
 
+    def _handle_text_press(self, pos: QPoint, allow_creation=False):
+        idx = self._text_hit_test(pos)
+        if idx is not None:
+            self.selected_text_index = idx
+            self.selected_marker_index = None
+            self.selected_rectangle_index = None
+            self.rect_drag_mode = None
+            self._set_hover_marker(None)
+            self.optionsUpdated.emit()
+            self.update()
+            self._notify_text_selection()
+            if not self._text_dragging:
+                self._begin_text_drag(idx, pos)
+            return True
+        if allow_creation and self.tool == Tool.TEXT:
+            return self._add_text_at(pos)
+        return False
+
+    def _add_text_at(self, pos: QPoint):
+        text, ok = QInputDialog.getText(self, "插入文字", "请输入文字内容", QLineEdit.Normal, "")
+        if not ok:
+            return False
+        text = text.replace("\r", "").replace("\n", "").strip()
+        if not text:
+            return False
+        item = {
+            "pos": QPoint(pos),
+            "text": text,
+            "color": QColor(self.text_color),
+            "background": QColor(self.text_background_color),
+            "font_family": self.text_font_family,
+            "font_size": self.text_font_size,
+        }
+        self.text_items.append(item)
+        self.selected_text_index = len(self.text_items) - 1
+        self.selected_marker_index = None
+        self.selected_rectangle_index = None
+        self.rect_drag_mode = None
+        self._set_hover_marker(None)
+        self._begin_text_drag(self.selected_text_index, pos)
+        self.optionsUpdated.emit()
+        self.update()
+
+    def _notify_text_selection(self):
+        if hasattr(self, "owner_tab") and self.owner_tab:
+            item = None
+            if self._has_active_text():
+                item = dict(self.text_items[self.selected_text_index])
+            self.owner_tab.on_canvas_text_selection(item)
+        return True
+
+    def _edit_text(self, idx: int):
+        if idx is None or not (0 <= idx < len(self.text_items)):
+            return
+        item = self.text_items[idx]
+        text, ok = QInputDialog.getText(self, "修改文字", "编辑当前文字", QLineEdit.Normal, item["text"])
+        if not ok:
+            return
+        text = text.strip()
+        if not text:
+            return
+        item["text"] = text
+        self.optionsUpdated.emit()
+        self.update()
+
     def _begin_marker_drag(self):
         if not self._marker_dragging:
             self._marker_dragging = True
@@ -2056,6 +2318,23 @@ class AnnotationCanvas(QWidget):
     def _end_marker_drag(self):
         if self._marker_dragging:
             self._marker_dragging = False
+            view_pos = self.mapFromGlobal(QCursor.pos())
+            self._update_pointer_feedback(self._view_to_scene(view_pos))
+
+    def _begin_text_drag(self, idx: int, pos: QPoint):
+        self._text_dragging = True
+        self._text_drag_index = idx
+        self._text_drag_offset = pos - self.text_items[idx]["pos"]
+        if self.tool == Tool.TEXT:
+            self.setCursor(Qt.BlankCursor)
+        else:
+            self.setCursor(Qt.SizeAllCursor)
+
+    def _end_text_drag(self):
+        if self._text_dragging:
+            self._text_dragging = False
+            self._text_drag_index = None
+            self._text_drag_offset = QPoint()
             view_pos = self.mapFromGlobal(QCursor.pos())
             self._update_pointer_feedback(self._view_to_scene(view_pos))
 
@@ -2084,6 +2363,7 @@ class AnnotationCanvas(QWidget):
         if idx is not None:
             self.selected_rectangle_index = idx
             self.selected_marker_index = None
+            self.selected_text_index = None
             self.dragging_marker_index = None
             self.rect_drag_mode = 'move'
             self.rect_initial_rect = QRect(self.rectangles[idx]['rect'])
@@ -2108,6 +2388,7 @@ class AnnotationCanvas(QWidget):
         self.rectangles.append(rect_info)
         self.selected_rectangle_index = len(self.rectangles) - 1
         self.selected_marker_index = None
+        self.selected_text_index = None
         self.dragging_marker_index = None
         self.rect_drag_mode = 'resize'
         self.rect_drag_handle = 'bottom-right'
@@ -2133,6 +2414,27 @@ class AnnotationCanvas(QWidget):
             else:
                 painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(info['rect'], info['radius'], info['radius'])
+        for idx, item in enumerate(self.text_items):
+            text_color = item.get("color") or self.text_color
+            bounding, text_font, _ = self._text_geometry(item)
+            painter.setFont(text_font)
+            bg_color = item.get("background") or self.text_background_color
+            bg_qcolor = QColor(bg_color)
+            if bg_qcolor.isValid() and bg_qcolor.alpha() > 0:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(bg_qcolor)
+                painter.drawRect(bounding)
+            painter.setPen(QColor(text_color))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawText(item["pos"], item["text"])
+            if idx == self.selected_text_index:
+                highlight_rect = bounding.adjusted(-4, -3, 4, 3)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(247, 181, 0, 70))
+                painter.drawRect(highlight_rect)
+                painter.setPen(QPen(QColor("#f7b500")))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(highlight_rect)
         painter.setPen(Qt.NoPen)
         font = QFont()
         font.setBold(True)
@@ -2180,6 +2482,30 @@ class AnnotationCanvas(QWidget):
             else:
                 painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(info['rect'], info['radius'], info['radius'])
+        for idx, item in enumerate(self.text_items):
+            text_color = item.get("color") or self.text_color
+            text_font = QFont(item.get("font_family", self.text_font_family), item.get("font_size", self.text_font_size))
+            painter.setFont(text_font)
+            metrics = QFontMetrics(text_font)
+            bounding = metrics.boundingRect(item["text"])
+            bounding.moveTo(item["pos"])
+            bg_color = item.get("background")
+            if bg_color is None:
+                bg_color = self.text_background_color
+            bg_qcolor = QColor(bg_color)
+            if bg_qcolor.isValid() and bg_qcolor.alpha() > 0:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(bg_qcolor)
+                painter.drawRect(bounding.adjusted(-2, -2, 2, 2))
+            if idx == self.selected_text_index:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(247, 181, 0, 70))
+                painter.drawRect(bounding.adjusted(-4, -3, 4, 3))
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor("#f7b500")))
+                painter.drawRect(bounding.adjusted(-4, -3, 4, 3))
+            painter.setPen(QColor(text_color))
+            painter.drawText(item["pos"], item["text"])
         painter.setPen(Qt.NoPen)
         font = QFont()
         font.setBold(True)
@@ -2209,6 +2535,26 @@ class AnnotationCanvas(QWidget):
             if ellipse_rect.contains(pos):
                 return idx
         return None
+
+    def _text_hit_test(self, pos: QPoint):
+        for idx in reversed(range(len(self.text_items))):
+            rect, _, _ = self._text_geometry(self.text_items[idx])
+            if rect.adjusted(-6, -6, 6, 6).contains(pos):
+                return idx
+        return None
+
+    def _text_geometry(self, item):
+        font = QFont(
+            item.get("font_family", self.text_font_family),
+            item.get("font_size", self.text_font_size),
+        )
+        metrics = QFontMetrics(font)
+        text = item.get("text") or ""
+        width = max(1, metrics.horizontalAdvance(text))
+        height = max(1, metrics.height())
+        top_left = QPoint(item["pos"].x(), item["pos"].y() - metrics.ascent())
+        rect = QRect(top_left, QSize(width, height))
+        return rect, font, metrics
 
     def _rect_hit_test(self, pos: QPoint):
         for idx in reversed(range(len(self.rectangles))):
@@ -2293,6 +2639,8 @@ class AnnotationCanvas(QWidget):
     def _update_default_cursor(self):
         if self.tool == Tool.MARKER:
             self._update_cursor(Qt.CrossCursor)
+        elif self.tool == Tool.TEXT:
+            self._update_cursor(Qt.IBeamCursor)
         else:
             self._update_cursor(Qt.ArrowCursor)
 
@@ -2316,7 +2664,12 @@ class AnnotationTab(QWidget):
         self.image_quality = self._clamp_quality(image_quality)
         self.auto_save_enabled = bool(auto_save_enabled)
         self.canvas = AnnotationCanvas(pixmap)
-        self.canvas.apply_style_defaults(style_state.get("marker"), style_state.get("rectangle"))
+        self.canvas.owner_tab = self
+        self.canvas.apply_style_defaults(
+            style_state.get("marker"),
+            style_state.get("rectangle"),
+            style_state.get("text"),
+        )
         self.save_dir = save_dir
         if source_path:
             self.auto_saved_path = source_path
@@ -2326,6 +2679,8 @@ class AnnotationTab(QWidget):
             self._external_source = False
         self.style_state = style_state
         self.style_callback = style_callback
+        self._text_defaults = self._build_text_defaults(style_state.get("text"))
+        self._apply_text_defaults_to_canvas()
         self._current_tool = Tool.NONE
         self.base_status_text = self._default_base_status_text()
         self.dirty = False
@@ -2367,6 +2722,14 @@ class AnnotationTab(QWidget):
                 background: #2ed3a3;
                 color: #0c1c27;
             }
+            QToolBar#AnnotationToolbar QToolButton#Tool_text {
+                background: rgba(247,181,0,0.18);
+                color: #7a5007;
+            }
+            QToolBar#AnnotationToolbar QToolButton#Tool_text:checked {
+                background: #f7b500;
+                color: #060606;
+            }
             """
         )
 
@@ -2385,6 +2748,14 @@ class AnnotationTab(QWidget):
         marker_button = toolbar.widgetForAction(marker_action)
         if marker_button:
             marker_button.setObjectName("Tool_marker")
+
+        text_action = QAction("插入文字", self)
+        text_action.setCheckable(True)
+        text_action.triggered.connect(lambda: self._set_tool(Tool.TEXT))
+        toolbar.addAction(text_action)
+        text_button = toolbar.widgetForAction(text_action)
+        if text_button:
+            text_button.setObjectName("Tool_text")
 
         clear_action = QAction("清除标注", self)
         clear_action.triggered.connect(self.canvas.clear_annotations)
@@ -2406,11 +2777,16 @@ class AnnotationTab(QWidget):
         save_action.triggered.connect(self.save_annotated_image)
         toolbar.addAction(save_action)
 
-        self._tool_actions = {Tool.RECTANGLE: rect_action, Tool.MARKER: marker_action}
+        self._tool_actions = {
+            Tool.RECTANGLE: rect_action,
+            Tool.MARKER: marker_action,
+            Tool.TEXT: text_action,
+        }
         layout.addWidget(toolbar)
 
         self.marker_panel = MarkerOptionsPanel(self.canvas)
         self.rectangle_panel = RectangleOptionsPanel(self.canvas)
+        self.text_panel = TextOptionsPanel(self)
         self._options_placeholder = QWidget()
         self._options_placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -2419,12 +2795,18 @@ class AnnotationTab(QWidget):
         self.panel_stack.addWidget(self._options_placeholder)
         self.panel_stack.addWidget(self.marker_panel)
         self.panel_stack.addWidget(self.rectangle_panel)
+        self.panel_stack.addWidget(self.text_panel)
 
-        stack_height = max(self.marker_panel.sizeHint().height(), self.rectangle_panel.sizeHint().height())
+        stack_height = max(
+            self.marker_panel.sizeHint().height(),
+            self.rectangle_panel.sizeHint().height(),
+            self.text_panel.sizeHint().height(),
+        )
         self.panel_stack.setFixedHeight(stack_height)
         self._options_placeholder.setFixedHeight(stack_height)
         self.marker_panel.setMinimumHeight(stack_height)
         self.rectangle_panel.setMinimumHeight(stack_height)
+        self.text_panel.setMinimumHeight(stack_height)
 
         layout.addWidget(self.panel_stack)
 
@@ -2465,6 +2847,106 @@ class AnnotationTab(QWidget):
         self.reset_zoom_shortcut.activated.connect(self.canvas.reset_zoom)
         self.canvas.set_zoom(initial_zoom)
 
+    def _build_text_defaults(self, values):
+        defaults = DEFAULT_TEXT_STYLE.copy()
+        values = values or {}
+        defaults["color"] = values.get("color", defaults["color"])
+        defaults["background"] = values.get("background", defaults["background"])
+        defaults["font"] = values.get("font", defaults["font"])
+        try:
+            defaults["size"] = int(values.get("size", defaults["size"]))
+        except (TypeError, ValueError):
+            defaults["size"] = DEFAULT_TEXT_STYLE["size"]
+        return defaults
+
+    def _apply_text_defaults_to_canvas(self):
+        color = QColor(self._text_defaults["color"])
+        background = QColor(self._text_defaults["background"])
+        self.canvas.set_text_color(color)
+        self.canvas.set_text_background_color(background)
+        self.canvas.set_text_font_family(self._text_defaults["font"])
+        self.canvas.set_text_font_size(int(self._text_defaults["size"]))
+
+    def on_canvas_text_selection(self, item):
+        if item:
+            self.canvas.apply_text_style(item)
+        else:
+            self._apply_text_defaults_to_canvas()
+
+    def on_text_color_changed(self, color: QColor):
+        if self.canvas._has_active_text():
+            self.canvas.update_selected_text_color(color)
+            return
+        if not color or not color.isValid():
+            return
+        self._text_defaults["color"] = color.name(QColor.HexArgb)
+        self.canvas.set_text_color(color)
+        self._persist_style_defaults()
+
+    def on_text_background_changed(self, color: QColor):
+        if self.canvas._has_active_text():
+            self.canvas.update_selected_text_background(color)
+            return
+        if not color or not color.isValid():
+            return
+        self._text_defaults["background"] = color.name(QColor.HexArgb)
+        self.canvas.set_text_background_color(color)
+        self._persist_style_defaults()
+
+    def on_text_font_family_changed(self, family: str):
+        if self.canvas._has_active_text():
+            self.canvas.update_selected_text_font_family(family)
+            return
+        if not family:
+            return
+        self._text_defaults["font"] = family
+        self.canvas.set_text_font_family(family)
+        self._persist_style_defaults()
+
+    def on_text_font_size_changed(self, size: int):
+        if self.canvas._has_active_text():
+            self.canvas.update_selected_text_font_size(size)
+            return
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        size = max(8, min(72, size))
+        self._text_defaults["size"] = size
+        self.canvas.set_text_font_size(size)
+        self._persist_style_defaults()
+
+    def update_text_color_default(self, color: QColor):
+        if not color or not color.isValid():
+            return
+        self._text_defaults["color"] = color.name(QColor.HexArgb)
+        self.canvas.set_text_color(color)
+        self._persist_style_defaults()
+
+    def update_text_background_default(self, color: QColor):
+        if not color or not color.isValid():
+            return
+        self._text_defaults["background"] = color.name(QColor.HexArgb)
+        self.canvas.set_text_background_color(color)
+        self._persist_style_defaults()
+
+    def update_text_font_family_default(self, family: str):
+        if not family:
+            return
+        self._text_defaults["font"] = family
+        self.canvas.set_text_font_family(family)
+        self._persist_style_defaults()
+
+    def update_text_font_size_default(self, size: int):
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        size = max(8, min(72, size))
+        self._text_defaults["size"] = size
+        self.canvas.set_text_font_size(size)
+        self._persist_style_defaults()
+
     def _clamp_quality(self, value):
         try:
             value = int(value)
@@ -2503,13 +2985,16 @@ class AnnotationTab(QWidget):
         self.canvas.set_tool(tool)
         self._sync_tool_action_checks(tool)
         self._update_panel_visibility(preferred=tool)
+        if tool == Tool.TEXT and not self.canvas._has_active_text():
+            self._apply_text_defaults_to_canvas()
 
     def _handle_canvas_update(self):
         self._mark_dirty()
         self._update_panel_visibility()
     
     def _handle_escape(self):
-        if self._current_tool in (Tool.MARKER,):
+        self.canvas.clear_active_selection()
+        if self._current_tool in (Tool.MARKER, Tool.TEXT):
             self._set_tool(Tool.NONE)
 
     def _on_zoom_changed(self, factor):
@@ -2523,6 +3008,8 @@ class AnnotationTab(QWidget):
             target = Tool.MARKER
         elif kind == "rectangle":
             target = Tool.RECTANGLE
+        elif kind == "text":
+            target = Tool.TEXT
         else:
             target = preferred or self._current_tool
         if target == Tool.MARKER:
@@ -2531,17 +3018,22 @@ class AnnotationTab(QWidget):
         elif target == Tool.RECTANGLE:
             self.panel_stack.setCurrentWidget(self.rectangle_panel)
             self._set_panel_active_state(rectangle=True)
+        elif target == Tool.TEXT:
+            self.panel_stack.setCurrentWidget(self.text_panel)
+            self._set_panel_active_state(text=True)
         else:
             self.panel_stack.setCurrentWidget(self._options_placeholder)
             self._set_panel_active_state()
-        tracking = target if target in (Tool.MARKER, Tool.RECTANGLE) else Tool.NONE
+        tracking = target if target in (Tool.MARKER, Tool.RECTANGLE, Tool.TEXT) else Tool.NONE
         self._sync_tool_action_checks(tracking)
 
-    def _set_panel_active_state(self, marker=False, rectangle=False):
+    def _set_panel_active_state(self, marker=False, rectangle=False, text=False):
         if hasattr(self.marker_panel, "set_panel_active"):
             self.marker_panel.set_panel_active(bool(marker))
         if hasattr(self.rectangle_panel, "set_panel_active"):
             self.rectangle_panel.set_panel_active(bool(rectangle))
+        if hasattr(self.text_panel, "set_panel_active"):
+            self.text_panel.set_panel_active(bool(text))
 
     def _sync_tool_action_checks(self, active_tool: Tool):
         actions = getattr(self, "_tool_actions", {})
@@ -2630,8 +3122,10 @@ class AnnotationTab(QWidget):
             return
         marker_style = self.canvas.marker_style_state()
         rect_style = self.canvas.rectangle_style_state()
+        text_style = self.canvas.text_style_state()
         self.style_callback("marker", marker_style)
         self.style_callback("rectangle", rect_style)
+        self.style_callback("text", text_style)
 
     def maybe_close(self):
         if not self.dirty:
@@ -3012,6 +3506,123 @@ class RectangleOptionsPanel(QFrame):
         self.sync_from_canvas()
 
 
+class TextOptionsPanel(QFrame):
+    def __init__(self, tab):
+        super().__init__()
+        self.tab = tab
+        self.canvas = tab.canvas
+        self.setObjectName("TextPanel")
+        self._accent = QColor(PANEL_ACCENTS["text"])
+        self._active = False
+        self._apply_style()
+
+        layout = QHBoxLayout()
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 8, 10, 8)
+
+        def add_label(text):
+            label = QLabel(text)
+            label.setStyleSheet("color:#1e2433;font-size:12px;")
+            layout.addWidget(label)
+            return label
+
+        add_label("字体")
+        self.font_combo = QFontComboBox()
+        self.font_combo.currentFontChanged.connect(lambda f: tab.on_text_font_family_changed(f.family()))
+        layout.addWidget(self.font_combo)
+
+        add_label("字体大小")
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(8, 72)
+        self.size_spin.setFixedWidth(56)
+        self.size_spin.valueChanged.connect(tab.on_text_font_size_changed)
+        layout.addWidget(self.size_spin)
+
+        add_label("字体颜色")
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(24, 24)
+        self.color_btn.setCursor(Qt.PointingHandCursor)
+        self.color_btn.clicked.connect(self._choose_color)
+        layout.addWidget(self.color_btn)
+
+        add_label("背景颜色")
+        self.bg_color_btn = QPushButton()
+        self.bg_color_btn.setFixedSize(24, 24)
+        self.bg_color_btn.setCursor(Qt.PointingHandCursor)
+        self.bg_color_btn.clicked.connect(self._choose_background_color)
+        layout.addWidget(self.bg_color_btn)
+        self.transparent_btn = QPushButton("透明")
+        self.transparent_btn.setCursor(Qt.PointingHandCursor)
+        self.transparent_btn.setProperty("class", "option-chip")
+        self.transparent_btn.clicked.connect(self._set_transparent_background)
+        layout.addWidget(self.transparent_btn)
+        layout.addStretch()
+        self.setLayout(layout)
+
+        self.canvas.optionsUpdated.connect(self.sync_from_canvas)
+        self.sync_from_canvas()
+
+    def _apply_style(self):
+        accent = self._accent.name()
+        light = QColor(self._accent).lighter(200).name()
+        self.setStyleSheet(
+            f"""
+            QFrame#TextPanel {{
+                background-color: {light};
+                border-radius: 6px;
+                border: none;
+            }}
+            QFrame#TextPanel[active="true"] {{
+                background-color: {accent};
+            }}
+            """
+        )
+
+    def set_panel_active(self, active: bool):
+        if getattr(self, "_active", False) == active:
+            return
+        self._active = active
+        self.setProperty("active", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def sync_from_canvas(self):
+        self.size_spin.blockSignals(True)
+        self.size_spin.setValue(self.canvas.text_font_size)
+        self.size_spin.blockSignals(False)
+        self.font_combo.blockSignals(True)
+        self.font_combo.setCurrentFont(QFont(self.canvas.text_font_family))
+        self.font_combo.blockSignals(False)
+        self._update_color_button()
+        self._update_bg_color_button()
+
+    def _update_color_button(self):
+        color = self.canvas.text_color
+        self.color_btn.setStyleSheet(
+            f"background-color: {color.name(QColor.HexArgb)}; border-radius: 4px; border: 1px solid #cfd6e6;"
+        )
+
+    def _update_bg_color_button(self):
+        bg = self.canvas.text_background_color
+        self.bg_color_btn.setStyleSheet(
+            f"background-color: {bg.name(QColor.HexArgb)}; border-radius: 4px; border: 1px solid #cfd6e6;"
+        )
+
+    def _choose_color(self):
+        color = QColorDialog.getColor(self.canvas.text_color, self, "选择文字颜色")
+        if color.isValid():
+            self.tab.on_text_color_changed(color)
+
+    def _choose_background_color(self):
+        color = QColorDialog.getColor(self.canvas.text_background_color, self, "选择背景颜色")
+        if color.isValid():
+            self.tab.on_text_background_changed(color)
+
+    def _set_transparent_background(self):
+        transparent = QColor(0, 0, 0, 0)
+        self.tab.on_text_background_changed(transparent)
+
+
 class AnnotationWorkspacePage(QWidget):
     def __init__(
         self,
@@ -3372,11 +3983,16 @@ class ScreenSnapApp(QMainWindow):
             self.exit_unsaved_policy = "save_all"
         self.marker_style = self.config.get("marker_style", DEFAULT_MARKER_STYLE.copy())
         self.rectangle_style = self.config.get("rectangle_style", DEFAULT_RECT_STYLE.copy())
+        self.text_style = self.config.get("text_style", DEFAULT_TEXT_STYLE.copy())
 
         self.workspace_page = AnnotationWorkspacePage(
             lambda: self._open_settings_dialog(),
             self._open_images_dialog,
-            {"marker": self.marker_style, "rectangle": self.rectangle_style},
+            {
+                "marker": self.marker_style,
+                "rectangle": self.rectangle_style,
+                "text": self.text_style,
+            },
             self._on_style_changed,
             self._image_quality,
             self.auto_save_enabled,
@@ -3712,6 +4328,9 @@ class ScreenSnapApp(QMainWindow):
         elif style_type == "rectangle":
             self.rectangle_style.update(data)
             self.config["rectangle_style"] = self.rectangle_style
+        elif style_type == "text":
+            self.text_style.update(data)
+            self.config["text_style"] = self.text_style
         save_config(self.config)
 
     def _register_all_hotkeys(self):
