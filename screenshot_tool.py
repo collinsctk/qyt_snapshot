@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import winreg
 from datetime import datetime
 from enum import Enum, auto
@@ -1387,29 +1388,48 @@ class AITranslationPanel(QWidget):
         self.tabs.setCurrentWidget(tab)
         self.status_label.setText("AI 正在识别并翻译截图...")
         worker = AITranslationWorker(image_bytes, self._ai_settings)
-        worker.completed.connect(lambda original, translation, tab=tab: self._on_translation_success(tab, original, translation))
-        worker.failed.connect(lambda message, tab=tab: self._on_translation_failure(tab, message))
+        start_time = time.perf_counter()
+        worker.completed.connect(
+            lambda original, translation, tab=tab, start=start_time: self._on_translation_success(
+                tab, original, translation, start
+            )
+        )
+        worker.failed.connect(
+            lambda message, tab=tab, start=start_time: self._on_translation_failure(tab, message, start)
+        )
         worker.finished.connect(lambda w=worker: self._cleanup_worker(w))
         self._workers.append(worker)
         worker.start()
 
-    def _on_translation_success(self, tab, original, translation):
+    def _on_translation_success(self, tab, original, translation, start_time=None):
         tab.set_texts(original, translation)
         idx = self.tabs.indexOf(tab)
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.tabs.setTabText(idx, f"{idx + 1}. {timestamp}")
+        duration_text = ""
+        if start_time is not None:
+            duration = time.perf_counter() - start_time
+            duration_text = f"（消耗时间: {duration:.2f}秒）"
         if translation:
             QApplication.clipboard().setText(translation)
-            self.status_label.setText("识别完成，译文已复制到剪贴板。")
+            self.status_label.setText(
+                f"识别完成，译文已复制到剪贴板。{duration_text}"
+            )
         else:
-            self.status_label.setText("识别完成，请手动复制需要的内容。")
+            self.status_label.setText(
+                f"识别完成，请手动复制需要的内容。{duration_text}"
+            )
         self.translationCompleted.emit()
 
-    def _on_translation_failure(self, tab, message):
+    def _on_translation_failure(self, tab, message, start_time=None):
         idx = self.tabs.indexOf(tab)
         if idx >= 0:
             self.tabs.setTabText(idx, f"{idx + 1}. 失败")
-        self.status_label.setText(f"AI 识别失败：{message}")
+        duration_text = ""
+        if start_time is not None:
+            duration = time.perf_counter() - start_time
+            duration_text = f"（消耗时间: {duration:.2f}秒）"
+        self.status_label.setText(f"AI 识别失败：{message}{duration_text}")
 
     def _cleanup_worker(self, worker):
         if worker in self._workers:
