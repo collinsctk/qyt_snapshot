@@ -416,9 +416,9 @@ class AITranslationService:
         if not value:
             return ""
         cleaned = value.strip()
-        cleaned = cleaned.replace("\t", " ").replace("\r", " ")
+        cleaned = cleaned.replace("\t", " ")
+        cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
         cleaned = cleaned.replace("\ufffd", "")
-        cleaned = " ".join(part for part in cleaned.splitlines() if part)
         return cleaned
 
 
@@ -3580,6 +3580,7 @@ class ScreenSnapApp(QMainWindow):
         self._last_selection_rect = QRect(selection_rect)
         self._last_capture_screen_name = screen_name
         self.home_page.set_repeat_enabled(True)
+        self._switch_page("ai")
         self._show_main_window()
         self.translation_panel.add_capture(pixmap)
 
