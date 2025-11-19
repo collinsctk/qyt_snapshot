@@ -971,7 +971,7 @@ class HotkeySettingsPage(QWidget):
         header = QLabel("为不同操作设置全局快捷键")
         header.setStyleSheet("font-size: 18px; font-weight: 600;")
         layout.addWidget(header)
-        desc = QLabel("设置后可以在任意窗口通过快捷键触发截图动作。您可以随时进行调整或清除。")
+        desc = QLabel("在此输入供应商提供的 Base URL、API Key 和模型名称，可点击“测试”确认是否具备图像识别能力。")
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
@@ -1053,7 +1053,7 @@ class QualitySettingsPage(QWidget):
         self._quality = self._clamp_quality(quality if quality is not None else DEFAULT_IMAGE_QUALITY)
         layout = QVBoxLayout()
 
-        title = QLabel("控制导出的截图品质")
+        title = QLabel("配置 AI 截图翻译能力")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
         layout.addWidget(title)
 
@@ -1222,14 +1222,23 @@ class AISettingsPage(QWidget):
         self._settings = _normalized_ai_settings(ai_settings or {})
         layout = QVBoxLayout()
 
-        title = QLabel("配置 AI 截图翻译能力")
+        title = QLabel(u"\u914d\u7f6e AI \u622a\u56fe\u7ffb\u8bd1\u80fd\u529b")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
         layout.addWidget(title)
 
-        desc = QLabel("在此输入供应商提供的 base_url、API Key 和模型名称，并可点击“测试”验证是否支持图片识别。")
+        desc = QLabel(u"\u5728\u6b64\u8f93\u5165\u4f9b\u5e94\u5546\u63d0\u4f9b\u7684 Base URL\u3001API Key \u548c\u6a21\u578b\u540d\u79f0\uff0c\u53ef\u70b9\u51fb\u201c\u6d4b\u8bd5\u201d\u786e\u8ba4\u662f\u5426\u5177\u5907\u56fe\u50cf\u8bc6\u522b\u80fd\u529b\u3002")
         desc.setWordWrap(True)
         desc.setStyleSheet("color: #4a4a4a;")
         layout.addWidget(desc)
+
+        reminder = QLabel(
+            u"\u63d0\u793a\uff1a\n"
+            u"\u0031\u002e\u0020\u63a5\u53e3\u9700\u8981\u517c\u5bb9 OpenAI Chat Completions \u534f\u8bae\uff1b\n"
+            u"\u0032\u002e\u0020\u6240\u9009\u6a21\u578b\u5fc5\u987b\u5177\u5907\u56fe\u50cf\u8bc6\u522b\uff08Vision\uff09\u80fd\u529b\u3002"
+        )
+        reminder.setWordWrap(True)
+        reminder.setStyleSheet("color: #b7410e; font-size: 12px; background: rgba(255,200,0,0.15); padding:6px; border-radius:6px; margin-bottom:6px;")
+        layout.addWidget(reminder)
 
         form = QFormLayout()
         self.base_url_edit = QLineEdit(self._settings.get("base_url", ""))
