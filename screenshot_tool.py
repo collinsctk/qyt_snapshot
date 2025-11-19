@@ -270,19 +270,25 @@ class AITranslationService:
             raise ValueError("截图内容为空，无法识别")
         client = self._ensure_client()
         base64_image = base64.b64encode(image_bytes).decode("ascii")
-        request_input = [
+        messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": prompt},
+                    {"type": "text", "text": prompt},
                     {
-                        "type": "input_image",
-                        "image_url": f"data:image/png;base64,{base64_image}",
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}",
+                        },
                     },
                 ],
             }
         ]
-        response = client.responses.create(model=self.settings["model"].strip(), input=request_input)
+        response = client.chat.completions.create(
+            model=self.settings["model"].strip(),
+            messages=messages,
+            stream=False,
+        )
         text = self._extract_response_text(response)
         original, translation = self._parse_translation(text)
         if original and not translation:
@@ -298,22 +304,57 @@ class AITranslationService:
             + text.strip()
             + "\n\n只返回翻译文本。"
         )
-        response = client.responses.create(
+        response = client.chat.completions.create(
             model=self.settings["model"].strip(),
-            input=[
+            messages=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": prompt},
+                        {"type": "text", "text": prompt},
                     ],
                 }
             ],
+            stream=False,
         )
         return (self._extract_response_text(response) or "").strip()
+
+    def _extract_chat_response_text(self, response):
+        choices = getattr(response, "choices", None)
+        if not choices:
+            return None
+        try:
+            first_choice = choices[0]
+        except (KeyError, IndexError, TypeError):
+            return None
+        message = getattr(first_choice, "message", None)
+        if message is None and isinstance(first_choice, dict):
+            message = first_choice.get("message")
+        if message is None:
+            return None
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict):
+                    text_value = part.get("text")
+                else:
+                    text_value = getattr(part, "text", None)
+                if isinstance(text_value, str):
+                    texts.append(text_value)
+            if texts:
+                return "\n".join(texts)
+        return None
 
     def _extract_response_text(self, response) -> str:
         if response is None:
             return ""
+        chat_text = self._extract_chat_response_text(response)
+        if chat_text is not None:
+            return chat_text
         text = getattr(response, "output_text", None)
         if text:
             return text
