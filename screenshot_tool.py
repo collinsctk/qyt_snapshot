@@ -1347,7 +1347,10 @@ class TranslationTab(QWidget):
         translation = self.translation_edit.toPlainText()
         combined = original or ""
         if translation:
-            combined = f"{original} [{translation}]"
+            if combined:
+                combined = f"{combined}\n[{translation}]"
+            else:
+                combined = f"[{translation}]"
         QApplication.clipboard().setText(combined)
 
 
