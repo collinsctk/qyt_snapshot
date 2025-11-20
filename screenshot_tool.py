@@ -37,6 +37,7 @@ from PyQt5.QtGui import (
     QPixmap,
     QFont,
     QFontMetrics,
+    QFontDatabase,
     QIcon,
     QDesktopServices,
     QKeySequence,
@@ -125,6 +126,64 @@ DEFAULT_TEXT_STYLE = {
     "size": 18,
     "background": "transparent",
 }
+
+_FONT_SUPPORT_CACHE = {}
+_SAFE_FONT_FALLBACK = None
+
+
+def _font_family_supported(family, db=None):
+    key = (family or "").strip()
+    if not key:
+        return False
+    if QApplication.instance() is None:
+        return True
+    cached = _FONT_SUPPORT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    db = db or QFontDatabase()
+    if key not in db.families():
+        _FONT_SUPPORT_CACHE[key] = False
+        return False
+    styles = db.styles(key)
+    if not styles:
+        _FONT_SUPPORT_CACHE[key] = False
+        return False
+    for style in styles:
+        scalable = db.isSmoothlyScalable(key, style)
+        if not scalable and hasattr(db, "isScalable"):
+            scalable = db.isScalable(key, style)
+        if scalable:
+            _FONT_SUPPORT_CACHE[key] = True
+            return True
+    _FONT_SUPPORT_CACHE[key] = False
+    return False
+
+
+def _preferred_font_family():
+    global _SAFE_FONT_FALLBACK
+    if _SAFE_FONT_FALLBACK:
+        return _SAFE_FONT_FALLBACK
+    if QApplication.instance() is None:
+        _SAFE_FONT_FALLBACK = DEFAULT_TEXT_STYLE["font"]
+        return _SAFE_FONT_FALLBACK
+    db = QFontDatabase()
+    default = (DEFAULT_TEXT_STYLE["font"] or "").strip()
+    if default and _font_family_supported(default, db=db):
+        _SAFE_FONT_FALLBACK = default
+        return _SAFE_FONT_FALLBACK
+    for family in db.families():
+        if _font_family_supported(family, db=db):
+            _SAFE_FONT_FALLBACK = family
+            return _SAFE_FONT_FALLBACK
+    _SAFE_FONT_FALLBACK = default or "Arial"
+    return _SAFE_FONT_FALLBACK
+
+
+def _sanitize_font_family(family: str) -> str:
+    family = (family or "").strip()
+    if family and _font_family_supported(family):
+        return family
+    return _preferred_font_family()
 
 DEFAULT_IMAGE_QUALITY = 95
 AI_TRANSLATION_PROMPT = (
@@ -1898,7 +1957,7 @@ class AnnotationCanvas(QWidget):
         style = text_style or {}
         color = QColor(style.get("color", DEFAULT_TEXT_STYLE["color"]))
         background = QColor(style.get("background", DEFAULT_TEXT_STYLE["background"]))
-        font_family = style.get("font", DEFAULT_TEXT_STYLE["font"])
+        font_family = _sanitize_font_family(style.get("font", DEFAULT_TEXT_STYLE["font"]))
         try:
             size = int(style.get("size", DEFAULT_TEXT_STYLE["size"]))
         except (TypeError, ValueError):
@@ -1915,7 +1974,7 @@ class AnnotationCanvas(QWidget):
             return
         color = QColor(style.get("color", self.text_color))
         bg = QColor(style.get("background", self.text_background_color))
-        font_family = style.get("font", self.text_font_family)
+        font_family = _sanitize_font_family(style.get("font", self.text_font_family))
         try:
             font_size = int(style.get("font_size", style.get("size", self.text_font_size)))
         except (TypeError, ValueError):
@@ -1970,6 +2029,7 @@ class AnnotationCanvas(QWidget):
         self.update()
 
     def set_text_font_family(self, family: str):
+        family = _sanitize_font_family(family)
         if not family:
             return
         self.text_font_family = family
@@ -2006,7 +2066,10 @@ class AnnotationCanvas(QWidget):
         self.update()
 
     def update_selected_text_font_family(self, family: str):
-        if not family or not self._has_active_text():
+        if not self._has_active_text():
+            return
+        family = _sanitize_font_family(family)
+        if not family:
             return
         item = self.text_items[self.selected_text_index]
         item["font_family"] = family
@@ -2861,7 +2924,7 @@ class AnnotationTab(QWidget):
         values = values or {}
         defaults["color"] = values.get("color", defaults["color"])
         defaults["background"] = values.get("background", defaults["background"])
-        defaults["font"] = values.get("font", defaults["font"])
+        defaults["font"] = _sanitize_font_family(values.get("font", defaults["font"]))
         try:
             defaults["size"] = int(values.get("size", defaults["size"]))
         except (TypeError, ValueError):
@@ -2903,10 +2966,9 @@ class AnnotationTab(QWidget):
         self._persist_style_defaults()
 
     def on_text_font_family_changed(self, family: str):
+        family = _sanitize_font_family(family)
         if self.canvas._has_active_text():
             self.canvas.update_selected_text_font_family(family)
-            return
-        if not family:
             return
         self._text_defaults["font"] = family
         self.canvas.set_text_font_family(family)
@@ -2940,6 +3002,7 @@ class AnnotationTab(QWidget):
         self._persist_style_defaults()
 
     def update_text_font_family_default(self, family: str):
+        family = _sanitize_font_family(family)
         if not family:
             return
         self._text_defaults["font"] = family
@@ -3537,6 +3600,7 @@ class TextOptionsPanel(QFrame):
 
         add_label("字体")
         self.font_combo = QFontComboBox()
+        self.font_combo.setFontFilters(QFontComboBox.ScalableFonts)
         self.font_combo.currentFontChanged.connect(lambda f: tab.on_text_font_family_changed(f.family()))
         layout.addWidget(self.font_combo)
 
@@ -3993,6 +4057,7 @@ class ScreenSnapApp(QMainWindow):
         self.marker_style = self.config.get("marker_style", DEFAULT_MARKER_STYLE.copy())
         self.rectangle_style = self.config.get("rectangle_style", DEFAULT_RECT_STYLE.copy())
         self.text_style = self.config.get("text_style", DEFAULT_TEXT_STYLE.copy())
+        self.text_style["font"] = _sanitize_font_family(self.text_style.get("font"))
 
         self.workspace_page = AnnotationWorkspacePage(
             lambda: self._open_settings_dialog(),
