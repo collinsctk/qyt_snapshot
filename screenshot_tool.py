@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -4114,6 +4114,18 @@ class ScreenSnapApp(QMainWindow):
         exit_button = self.nav_toolbar.widgetForAction(exit_action)
         if exit_button:
             exit_button.setObjectName("Nav_exit")
+        
+        # 添加spacer将作者信息推到右边
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.nav_toolbar.addWidget(spacer)
+        
+        # 添加作者信息标签（低调显示在右侧）
+        author_label = QLabel("Designed by 乾颐堂 现任明教教主")
+        author_label.setObjectName("AuthorLabel")
+        author_label.setStyleSheet("color: rgba(255,255,255,0.4); font-size: 11px; padding-right: 8px;")
+        self.nav_toolbar.addWidget(author_label)
+        
         self._apply_nav_toolbar_style()
         root_layout.addWidget(self.nav_toolbar)
 
