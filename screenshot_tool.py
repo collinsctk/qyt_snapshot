@@ -2415,10 +2415,12 @@ class AnnotationCanvas(QWidget):
         rect = self._selection_bounds()
         if rect is None:
             return False
-        painter = QPainter(self.base_pixmap)
+        image = self.base_pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+        painter = QPainter(image)
         painter.setCompositionMode(QPainter.CompositionMode_Clear)
         painter.fillRect(rect, Qt.transparent)
         painter.end()
+        self.base_pixmap = QPixmap.fromImage(image)
         self.selection_rect = None
         self.update()
         self.optionsUpdated.emit()
