@@ -415,7 +415,20 @@ def _markdownish_to_html(text: str) -> str:
     """Render简单 Markdown 风格文本为 HTML，保留列表与加粗。"""
     if not text:
         return ""
-    lines = text.splitlines()
+    # 预处理：压缩连续空行，去掉首尾空行
+    raw_lines = text.splitlines()
+    lines = []
+    for line in raw_lines:
+        if line.strip():
+            lines.append(line)
+        else:
+            if lines and lines[-1] != "":
+                lines.append("")
+    if lines and lines[0] == "":
+        lines = lines[1:]
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+
     html_lines = []
     for raw in lines:
         stripped = raw.strip()
@@ -429,14 +442,14 @@ def _markdownish_to_html(text: str) -> str:
             )
         else:
             if not stripped:
-                html_lines.append("<br>")
+                html_lines.append("<div style=\"height:6px;\"></div>")
             else:
-                html_lines.append(f"<div style=\"margin:0 0 6px 0;\">{_apply_bold_html(raw)}</div>")
+                html_lines.append(f"<div style=\"margin:2px 0 6px 0;\">{_apply_bold_html(raw)}</div>")
     body = "\n".join(html_lines)
     return (
         "<html><head><meta charset=\"utf-8\"></head><body>"
-        "<div style=\"font-family:'Microsoft YaHei Light','Microsoft YaHei',sans-serif;"
-        " font-size:14px; line-height:1.6; color:#1e2433; white-space: pre-wrap;\">"
+        "<div style=\"font-family:'微软雅黑 Light','Microsoft YaHei Light','Microsoft YaHei',sans-serif;"
+        " font-size:14px; line-height:1.55; color:#1e2433; white-space: normal;\">"
         f"{body}</div></body></html>"
     )
 
