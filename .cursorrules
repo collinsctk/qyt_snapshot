@@ -1,0 +1,13 @@
+# Cursor AI 规则配置
+
+## Git Commit 规则
+- 所有自动生成的 git commit message 必须使用中文
+- Commit message 格式：简洁明了地描述本次更改的主要内容
+- 使用中文描述代码变更、功能添加、bug修复等内容
+
+## 语言偏好
+- 代码注释：中文
+- 文档说明：中文
+- Git commit message：中文
+
+

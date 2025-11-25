@@ -417,31 +417,27 @@ def _markdownish_to_html(text: str) -> str:
         return ""
     lines = text.splitlines()
     html_lines = []
-    in_list = False
     for raw in lines:
         stripped = raw.strip()
         is_bullet = bool(stripped.startswith("- ") or stripped.startswith("• "))
-        if is_bullet and not in_list:
-            html_lines.append("<ul style=\"margin:0 0 6px 0; padding-left:18px;\">")
-            in_list = True
-        if not is_bullet and in_list:
-            html_lines.append("</ul>")
-            in_list = False
         if is_bullet:
             content = stripped[2:].lstrip()
-            html_lines.append(f"<li>{_apply_bold_html(content)}</li>")
+            html_lines.append(
+                "<div style=\"margin:4px 0; padding-left:14px; text-indent:-10px;\">"
+                f"&#8226;&nbsp;{_apply_bold_html(content)}"
+                "</div>"
+            )
         else:
             if not stripped:
                 html_lines.append("<br>")
             else:
-                html_lines.append(f"<p style=\"margin:0 0 6px 0;\">{_apply_bold_html(raw)}</p>")
-    if in_list:
-        html_lines.append("</ul>")
+                html_lines.append(f"<div style=\"margin:0 0 6px 0;\">{_apply_bold_html(raw)}</div>")
     body = "\n".join(html_lines)
     return (
+        "<html><head><meta charset=\"utf-8\"></head><body>"
         "<div style=\"font-family:'Microsoft YaHei Light','Microsoft YaHei',sans-serif;"
-        " font-size:14px; line-height:1.6; color:#1e2433;\">"
-        f"{body}</div>"
+        " font-size:14px; line-height:1.6; color:#1e2433; white-space: pre-wrap;\">"
+        f"{body}</div></body></html>"
     )
 
 
