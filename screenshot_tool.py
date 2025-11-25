@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+import tempfile
 import winreg
 from datetime import datetime
 from enum import Enum, auto
@@ -85,9 +86,32 @@ from PyQt5.QtWidgets import (
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _determine_user_data_dir():
+    candidates = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(os.path.join(appdata, "CTKSnapshot"))
+    home = os.path.expanduser("~")
+    if home:
+        candidates.append(os.path.join(home, ".ctk_snapshot"))
+    candidates.append(os.path.join(BASE_DIR, "user_data"))
+    last_error = None
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path, None
+        except OSError as exc:
+            last_error = exc
+    return BASE_DIR, last_error
+
+
+USER_DATA_DIR, _USER_DATA_ERROR = _determine_user_data_dir()
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-USER_CONFIG_FILE = os.path.join(BASE_DIR, "user.json")
-DEFAULT_SAVE_DIR = os.path.join(BASE_DIR, "screenshots")
+LEGACY_USER_CONFIG_FILE = os.path.join(BASE_DIR, "user.json")
+USER_CONFIG_FILE = os.path.join(USER_DATA_DIR, "user.json")
+DEFAULT_SAVE_DIR = os.path.join(USER_DATA_DIR, "screenshots")
 ICON_PATH = os.path.join(BASE_DIR, "favicon", "favicon.ico")
 _APP_ICON = None
 CLASSIC_COLORS = [
@@ -271,18 +295,20 @@ def _notify_instance_running():
 
 
 def _load_json_file(path):
-    if os.path.exists(path):
+    if not os.path.exists(path):
+        return {}
+    try:
         with open(path, "r", encoding="utf-8") as handle:
-            try:
-                return json.load(handle)
-            except json.JSONDecodeError:
-                return {}
-    return {}
+            return json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 def load_config():
     defaults = _load_json_file(CONFIG_FILE)
     overrides = _load_json_file(USER_CONFIG_FILE)
+    if not overrides and os.path.exists(LEGACY_USER_CONFIG_FILE):
+        overrides = _load_json_file(LEGACY_USER_CONFIG_FILE)
     config = {}
     if isinstance(defaults, dict):
         config.update(defaults)
@@ -291,9 +317,26 @@ def load_config():
     return config
 
 
-def save_config(data):
-    with open(USER_CONFIG_FILE, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, ensure_ascii=False)
+def _show_message_box(title, text, parent=None, critical=False):
+    try:
+        func = QMessageBox.critical if critical else QMessageBox.warning
+        func(parent, title, text)
+    except Exception:
+        print(f"{title}: {text}", file=sys.stderr)
+
+
+def save_config(data, parent=None):
+    try:
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
+        with open(USER_CONFIG_FILE, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        _show_message_box(
+            "保存配置失败",
+            f"无法写入用户配置文件，请检查写入权限或选择可写目录。\n\n系统信息: {exc}",
+            parent=parent,
+            critical=True,
+        )
 
 
 def _normalized_ai_settings(settings):
@@ -2936,7 +2979,7 @@ class AnnotationTab(QWidget):
             self.auto_saved_path = source_path
             self._external_source = True
         else:
-            self.auto_saved_path = self._auto_save_pixmap(pixmap)
+            self.auto_saved_path = self._auto_save_pixmap(pixmap) or "未保存截图"
             self._external_source = False
         self.style_state = style_state
         self.style_callback = style_callback
@@ -3244,12 +3287,70 @@ class AnnotationTab(QWidget):
         self.image_quality = self._clamp_quality(value)
 
     def _auto_save_pixmap(self, pixmap: QPixmap):
-        os.makedirs(self.save_dir, exist_ok=True)
+        target_dir = self.save_dir or DEFAULT_SAVE_DIR
+        errors = []
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            errors.append((target_dir, exc))
+            fallback_dir = DEFAULT_SAVE_DIR
+            if target_dir != fallback_dir:
+                try:
+                    os.makedirs(fallback_dir, exist_ok=True)
+                    QMessageBox.warning(
+                        self,
+                        "保存目录不可用",
+                        f"无法写入截图目录：{target_dir}\n已切换到默认目录：{fallback_dir}\n\n系统信息: {exc}",
+                    )
+                    target_dir = fallback_dir
+                    self.save_dir = fallback_dir
+                except OSError as fallback_exc:
+                    errors.append((fallback_dir, fallback_exc))
+                    temp_dir = os.path.join(tempfile.gettempdir(), "ctk_snapshot")
+                    try:
+                        os.makedirs(temp_dir, exist_ok=True)
+                        QMessageBox.warning(
+                            self,
+                            "保存目录不可用",
+                            f"无法写入截图目录：{target_dir}\n已切换到临时目录：{temp_dir}\n\n系统信息: {exc}\n{fallback_exc}",
+                        )
+                        target_dir = temp_dir
+                        self.save_dir = temp_dir
+                    except OSError as temp_exc:
+                        errors.append((temp_dir, temp_exc))
+                        combined = "\n".join(f"{path}: {err}" for path, err in errors)
+                        QMessageBox.critical(
+                            self,
+                            "保存失败",
+                            f"无法写入任何截图目录，请检查权限或磁盘空间。\n\n{combined}",
+                        )
+                        return None
+            else:
+                temp_dir = os.path.join(tempfile.gettempdir(), "ctk_snapshot")
+                try:
+                    os.makedirs(temp_dir, exist_ok=True)
+                    QMessageBox.warning(
+                        self,
+                        "保存目录不可用",
+                        f"无法写入截图目录：{target_dir}\n已切换到临时目录：{temp_dir}\n\n系统信息: {exc}",
+                    )
+                    target_dir = temp_dir
+                    self.save_dir = temp_dir
+                except OSError as temp_exc:
+                    errors.append((temp_dir, temp_exc))
+                    combined = "\n".join(f"{path}: {err}" for path, err in errors)
+                    QMessageBox.critical(
+                        self,
+                        "保存失败",
+                        f"无法写入任何截图目录，请检查权限或磁盘空间。\n\n{combined}",
+                    )
+                    return None
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"screenshot_{timestamp}.png"
-        path = os.path.join(self.save_dir, filename)
+        path = os.path.join(target_dir, filename)
         if self.auto_save_enabled:
-            pixmap.save(path, "PNG")
+            if not pixmap.save(path, "PNG"):
+                QMessageBox.warning(self, "保存失败", f"无法自动保存截图到 {path}")
         return path
 
     def save_annotated_image(self):
@@ -3376,7 +3477,7 @@ class AnnotationTab(QWidget):
             return
         self.auto_save_enabled = enabled
         if not self._external_source and self.auto_save_enabled:
-            self.auto_saved_path = self._auto_save_pixmap(self.canvas.base_pixmap)
+            self.auto_saved_path = self._auto_save_pixmap(self.canvas.base_pixmap) or self.auto_saved_path
         self.base_status_text = self._default_base_status_text()
         if not self.dirty:
             self.status_label.setText(self.base_status_text)
@@ -4496,7 +4597,16 @@ class ScreenSnapApp(QMainWindow):
 
     def _open_save_folder(self):
         target_dir = self._resolved_save_dir()
-        os.makedirs(target_dir, exist_ok=True)
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            _show_message_box(
+                "保存目录不可用",
+                f"无法访问保存目录：{target_dir}\n请检查权限或更换目录。\n\n系统信息: {exc}",
+                parent=self,
+                critical=True,
+            )
+            return
         QDesktopServices.openUrl(QUrl.fromLocalFile(target_dir))
 
     def _open_workspace(self):
@@ -4531,12 +4641,50 @@ class ScreenSnapApp(QMainWindow):
         self.close()
 
     def _prepare_save_dir(self):
-        save_dir = self._resolved_save_dir()
-        os.makedirs(save_dir, exist_ok=True)
-        if self._save_dir:
-            self.config["save_dir"] = self._save_dir
-            save_config(self.config)
-        return save_dir
+        current_dir = self._resolved_save_dir()
+        temp_dir = os.path.join(tempfile.gettempdir(), "ctk_snapshot")
+        candidates = [(current_dir, "current")]
+        if current_dir != DEFAULT_SAVE_DIR:
+            candidates.append((DEFAULT_SAVE_DIR, "default"))
+        if temp_dir not in {path for path, _ in candidates}:
+            candidates.append((temp_dir, "temp"))
+        errors = []
+        for path, label in candidates:
+            try:
+                os.makedirs(path, exist_ok=True)
+                if label == "current" and self._save_dir:
+                    self.config["save_dir"] = self._save_dir
+                    save_config(self.config, parent=self)
+                if label == "default" and errors:
+                    _show_message_box(
+                        "保存目录不可用",
+                        f"无法创建保存目录：{errors[0][0]}\n已切换到默认目录：{DEFAULT_SAVE_DIR}\n\n系统信息: {errors[0][1]}",
+                        parent=self,
+                    )
+                    self._save_dir = ""
+                    self.config["save_dir"] = self._save_dir
+                    save_config(self.config, parent=self)
+                elif label == "temp" and errors:
+                    combined = "\n".join(f"{p}: {e}" for p, e in errors)
+                    _show_message_box(
+                        "保存目录不可用",
+                        f"无法创建保存目录：{current_dir}\n已切换到临时目录：{temp_dir}\n请在设置中更换到有写入权限的目录。\n\n{combined}",
+                        parent=self,
+                    )
+                    self._save_dir = temp_dir
+                    self.config["save_dir"] = self._save_dir
+                    save_config(self.config, parent=self)
+                return path
+            except OSError as exc:
+                errors.append((path, exc))
+        combined = "\n".join(f"{p}: {e}" for p, e in errors)
+        _show_message_box(
+            "保存目录不可用",
+            f"无法创建任何可用的保存目录，请检查权限或磁盘空间。\n\n{combined}",
+            parent=self,
+            critical=True,
+        )
+        return None
 
     def _start_capture_session(self, handler):
         self._pending_capture_handler = handler
@@ -4544,13 +4692,17 @@ class ScreenSnapApp(QMainWindow):
         QTimer.singleShot(200, self._start_overlay_capture)
 
     def initiate_capture(self):
-        self._prepare_save_dir()
+        save_dir = self._prepare_save_dir()
+        if not save_dir:
+            return
         self._start_capture_session(self._handle_annotation_capture)
 
     def start_ai_translation_capture(self):
         if not self._ensure_ai_ready():
             return
-        self._prepare_save_dir()
+        save_dir = self._prepare_save_dir()
+        if not save_dir:
+            return
         self._start_capture_session(self._handle_ai_translation_capture)
 
     def _start_overlay_capture(self):
@@ -4651,7 +4803,7 @@ class ScreenSnapApp(QMainWindow):
             return
         self.workspace_zoom = clamped
         self.config["workspace_zoom"] = self.workspace_zoom
-        save_config(self.config)
+        save_config(self.config, parent=self)
 
     def _open_settings_dialog(self, parent=None):
         dialog = SettingsDialog(parent or self, self.config)
@@ -4680,7 +4832,7 @@ class ScreenSnapApp(QMainWindow):
                 self.exit_unsaved_policy = "save_all"
             self.config["close_behavior"] = self.close_behavior
             self.config["exit_unsaved_policy"] = self.exit_unsaved_policy
-            save_config(self.config)
+            save_config(self.config, parent=self)
             self.workspace_page.set_image_quality(self._image_quality)
             self.workspace_page.set_auto_save_enabled(self.auto_save_enabled)
             self._sync_autostart_entry()
@@ -4699,7 +4851,7 @@ class ScreenSnapApp(QMainWindow):
         elif style_type == "text":
             self.text_style.update(data)
             self.config["text_style"] = self.text_style
-        save_config(self.config)
+        save_config(self.config, parent=self)
 
     def _register_all_hotkeys(self):
         self._hotkey_manager.unregister_all()
@@ -5011,6 +5163,12 @@ def main():
             qt_args.append(arg)
     sys.argv = qt_args
     app = QApplication(qt_args)
+    if _USER_DATA_ERROR:
+        _show_message_box(
+            "存储目录受限",
+            f"无法创建用户数据目录，将尝试使用程序所在目录保存数据，可能需要管理员权限。\n\n系统信息: {_USER_DATA_ERROR}",
+            critical=False,
+        )
     font = QFont("Microsoft YaHei", 10, QFont.Light)
     app.setFont(font)
     app.setWindowIcon(get_app_icon())
