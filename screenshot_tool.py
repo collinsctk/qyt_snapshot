@@ -248,6 +248,38 @@ def _sanitize_font_family(family: str) -> str:
         return family
     return _preferred_font_family()
 
+def _shorten_label(text: str, max_len: int = None) -> str:
+    if max_len is None:
+        try:
+            max_len = TAB_LABEL_MAX_LENGTH
+        except NameError:
+            max_len = 12
+    if not text:
+        return ""
+    text = str(text)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _dynamic_tab_label_length(tab_widget) -> int:
+    """估算可用宽度，动态控制 tab 文本长度，尽量容纳 20 个。"""
+    try:
+        bar = tab_widget.tabBar()
+        width = bar.width()
+    except Exception:
+        width = 0
+    if not width:
+        try:
+            width = tab_widget.width()
+        except Exception:
+            width = 900
+    target_tabs = 20
+    avg_width = max(40, width / float(target_tabs))
+    char_px = 7.5  # 粗略字符宽度
+    max_len = int(avg_width / char_px)
+    return max(6, min(20, max_len))
+
 DEFAULT_IMAGE_QUALITY = 95
 AI_TRANSLATION_PROMPT = (
     "请识别这张截图里的所有文字（保留原始顺序、标点和空格），并识别原文中的加粗/强调。"
@@ -261,6 +293,7 @@ DEFAULT_AI_SETTINGS = {
     "api_key": "",
     "model": "gpt-4.1-nano",
 }
+TAB_LABEL_MAX_LENGTH = 12
 WAIT_OBJECT_0 = 0x00000000
 WAIT_ABANDONED = 0x00000080
 WAIT_TIMEOUT = 0x00000102
@@ -4300,9 +4333,17 @@ class AnnotationWorkspacePage(QWidget):
             initial_zoom=initial_zoom,
         )
         label_path = source_path or tab.auto_saved_path
-        label = os.path.basename(label_path)
-        tab._base_label = label
-        self.tabs.addTab(tab, label)
+        full_label = os.path.basename(label_path)
+        short_len = _dynamic_tab_label_length(self.tabs)
+        short_label = _shorten_label(full_label, short_len)
+        tab._base_label = short_label
+        tab._full_label = full_label
+        idx = self.tabs.addTab(tab, short_label)
+        if hasattr(self.tabs, "tabBar"):
+            try:
+                self.tabs.tabBar().setTabToolTip(idx, full_label)
+            except Exception:
+                pass
         self._bind_tab_signals(tab)
         self.tabs.setCurrentWidget(tab)
         self._update_hint_visibility()
@@ -4322,6 +4363,11 @@ class AnnotationWorkspacePage(QWidget):
         base_label = getattr(tab, "_base_label", self.tabs.tabText(index).lstrip("* ").strip())
         prefix = "* " if dirty else ""
         self.tabs.setTabText(index, f"{prefix}{base_label}")
+        full_label = getattr(tab, "_full_label", base_label)
+        try:
+            self.tabs.tabBar().setTabToolTip(index, full_label)
+        except Exception:
+            pass
 
     def set_image_quality(self, value):
         self._image_quality = self._clamp_quality(value)
