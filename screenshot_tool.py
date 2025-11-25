@@ -44,6 +44,7 @@ from PyQt5.QtGui import (
     QFontMetrics,
     QFontDatabase,
     QIcon,
+    QBrush,
     QDesktopServices,
     QKeySequence,
     QCursor,
@@ -297,6 +298,7 @@ TAB_LABEL_MAX_LENGTH = 12
 SELECTION_HIT_MARGIN = 8
 SELECTION_HANDLE_SIZE = 8
 SELECTION_HANDLE_HIT_SIZE = 14
+CHECKER_TILE_SIZE = 12
 WAIT_OBJECT_0 = 0x00000000
 WAIT_ABANDONED = 0x00000080
 WAIT_TIMEOUT = 0x00000102
@@ -1889,6 +1891,7 @@ class AnnotationCanvas(QWidget):
         self.rect_drag_origin = QPoint()
         self.creating_new_rect = False
         self.creating_rect_origin = QPoint()
+        self._checker_brush = None
         self._marker_dragging = False
         self._text_dragging = False
         self._text_drag_index = None
@@ -2883,6 +2886,9 @@ class AnnotationCanvas(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.scale(self._zoom, self._zoom)
+        # Checkerboard background to显式展示透明区域
+        brush = self._checkerboard_brush()
+        painter.fillRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height(), brush)
         painter.drawPixmap(0, 0, self.base_pixmap)
         if self.selection_rect and self.selection_rect.width() > 1 and self.selection_rect.height() > 1:
             overlay = QColor("#0ea5e980")
@@ -3053,6 +3059,22 @@ class AnnotationCanvas(QWidget):
         half = self.HANDLE_SIZE // 2
         points = [rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()]
         return [QRect(p.x() - half, p.y() - half, self.HANDLE_SIZE, self.HANDLE_SIZE) for p in points]
+
+    def _checkerboard_brush(self):
+        if self._checker_brush is not None:
+            return self._checker_brush
+        size = CHECKER_TILE_SIZE
+        tile = QPixmap(size, size)
+        tile.fill(Qt.transparent)
+        painter = QPainter(tile)
+        light = QColor("#f5f5f5")
+        dark = QColor("#e0e0e0")
+        painter.fillRect(0, 0, size, size, light)
+        painter.fillRect(0, 0, size // 2, size // 2, dark)
+        painter.fillRect(size // 2, size // 2, size // 2, size // 2, dark)
+        painter.end()
+        self._checker_brush = QBrush(tile)
+        return self._checker_brush
 
     def _rect_handle_hit_test(self, pos: QPoint):
         handles = ['top-left', 'top-right', 'bottom-left', 'bottom-right']
@@ -3733,17 +3755,19 @@ class AnnotationTab(QWidget):
         self.canvas.flatten_all_annotations()
         pix = self.canvas.export_pixmap()
         image = pix.toImage().convertToFormat(QImage.Format_ARGB32)
+        # 临时 PNG 文件，便于部分应用（PPT/笔记）读取透明通道
+        tmp_path = os.path.join(tempfile.gettempdir(), "snapshot_clipboard.png")
+        image.save(tmp_path, "PNG")
         buffer = QBuffer()
         buffer.open(QIODevice.WriteOnly)
         image.save(buffer, "PNG")
         png_bytes = bytes(buffer.data())
         buffer.close()
         mime = QMimeData()
-        mime.setImageData(image)
         mime.setData("image/png", png_bytes)
+        mime.setUrls([QUrl.fromLocalFile(tmp_path)])
         clipboard = QApplication.clipboard()
         clipboard.setMimeData(mime)
-        clipboard.setImage(image)
         self.status_label.setText("已复制到剪贴板")
         self._mark_dirty()
 
