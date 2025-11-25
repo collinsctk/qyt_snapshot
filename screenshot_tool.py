@@ -1885,6 +1885,7 @@ class AnnotationCanvas(QWidget):
         self.rect_initial_rect = QRect()
         self.rect_drag_origin = QPoint()
         self.creating_new_rect = False
+        self.creating_rect_origin = QPoint()
         self._marker_dragging = False
         self._text_dragging = False
         self._text_drag_index = None
@@ -2487,6 +2488,7 @@ class AnnotationCanvas(QWidget):
         self.rect_initial_rect = QRect()
         self.rect_drag_origin = QPoint()
         self.creating_new_rect = False
+        self.creating_rect_origin = QPoint()
 
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton:
@@ -2566,7 +2568,14 @@ class AnnotationCanvas(QWidget):
             if self.rect_drag_mode == 'move':
                 rect.translate(delta)
             else:
-                rect = self._resize_rect(self.rect_initial_rect, self.rect_drag_handle, delta, event.modifiers())
+                if self.creating_new_rect and not self.creating_rect_origin.isNull():
+                    eff_pos = QPoint(
+                        max(pos.x(), self.creating_rect_origin.x() + 1),
+                        max(pos.y(), self.creating_rect_origin.y() + 1),
+                    )
+                    rect = QRect(self.creating_rect_origin, eff_pos)
+                else:
+                    rect = self._resize_rect(self.rect_initial_rect, self.rect_drag_handle, delta, event.modifiers())
             rect = rect.normalized()
             if rect.width() > 4 and rect.height() > 4:
                 info['rect'] = rect
@@ -2821,11 +2830,12 @@ class AnnotationCanvas(QWidget):
         self.rect_drag_handle = 'bottom-right'
         self.rect_initial_rect = QRect(rect_info['rect'])
         self.rect_drag_origin = QPoint(pos)
+        self.creating_rect_origin = QPoint(pos)
         self.rectangles_flattened = False
         self.creating_new_rect = True
         self._set_hover_marker(None)
         self.optionsUpdated.emit()
-        self._update_cursor(Qt.SizeFDiagCursor)
+        self._update_cursor(Qt.ArrowCursor)
         return True
 
     def paintEvent(self, event):
