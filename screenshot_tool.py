@@ -2,8 +2,10 @@
 import ctypes
 from ctypes import wintypes
 import hashlib
+import html
 import json
 import os
+import re
 import sys
 import time
 import tempfile
@@ -158,6 +160,40 @@ _FONT_SUPPORT_CACHE = {}
 _SAFE_FONT_FALLBACK = None
 
 
+def _ensure_qt_plugins_path():
+    """Ensure Qt platform plugins can be found when launching from source."""
+    try:
+        import PyQt5
+        from PyQt5.QtCore import QLibraryInfo, QCoreApplication
+    except Exception:
+        return
+
+    candidates = []
+    built_in = QLibraryInfo.location(QLibraryInfo.PluginsPath)
+    if built_in:
+        candidates.append(built_in)
+    pkg_plugins = os.path.join(os.path.dirname(getattr(PyQt5, "__file__", "")), "Qt", "plugins")
+    candidates.append(pkg_plugins)
+
+    valid_paths = []
+    for path in candidates:
+        platforms = os.path.join(path, "platforms")
+        if os.path.isfile(os.path.join(platforms, "qwindows.dll")):
+            valid_paths.append(path)
+    if not valid_paths:
+        return
+
+    plugin_path = valid_paths[0]
+    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", plugin_path)
+    os.environ.setdefault("QT_PLUGIN_PATH", plugin_path)
+    existing_paths = QCoreApplication.libraryPaths()
+    if plugin_path not in existing_paths:
+        QCoreApplication.setLibraryPaths([plugin_path] + existing_paths)
+    qt_bin = os.path.abspath(os.path.join(plugin_path, os.pardir, "bin"))
+    if os.path.isdir(qt_bin) and qt_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = qt_bin + os.pathsep + os.environ.get("PATH", "")
+
+
 def _font_family_supported(family, db=None):
     key = (family or "").strip()
     if not key:
@@ -214,9 +250,10 @@ def _sanitize_font_family(family: str) -> str:
 
 DEFAULT_IMAGE_QUALITY = 95
 AI_TRANSLATION_PROMPT = (
-    "请识别这张截图里的所有文字（保留原始顺序、标点和空格），"
-    "然后将识别结果和翻译合并到 JSON："
-    "{\"original\": \"原文\", \"translation\": \"翻译\"}。"
+    "请识别这张截图里的所有文字（保留原始顺序、标点和空格），并识别原文中的加粗/强调。"
+    "请在输出里用 **粗体** 标记加粗内容，并在译文中对应位置保持相同的 **粗体**。"
+    "最后将识别结果和翻译合并到 JSON："
+    "{\"original\": \"原文(保留**加粗**)\", \"translation\": \"翻译(同步**加粗**标记)\"}。"
 )
 DEFAULT_AI_SETTINGS = {
     "base_url": "https://aihubmix.com/v1",
@@ -360,6 +397,64 @@ def pixmap_to_png_bytes(pixmap: QPixmap) -> bytes:
     return data
 
 
+def _apply_bold_html(text: str) -> str:
+    """Convert **bold** markers into <strong> after escaping."""
+    if not text:
+        return ""
+    parts = []
+    last = 0
+    for match in re.finditer(r"\*\*(.+?)\*\*", text):
+        parts.append(html.escape(text[last:match.start()]))
+        parts.append(f"<strong>{html.escape(match.group(1))}</strong>")
+        last = match.end()
+    parts.append(html.escape(text[last:]))
+    return "".join(parts)
+
+
+def _markdownish_to_html(text: str) -> str:
+    """Render简单 Markdown 风格文本为 HTML，保留列表与加粗。"""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    html_lines = []
+    in_list = False
+    for raw in lines:
+        stripped = raw.strip()
+        is_bullet = bool(stripped.startswith("- ") or stripped.startswith("• "))
+        if is_bullet and not in_list:
+            html_lines.append("<ul style=\"margin:0 0 6px 0; padding-left:18px;\">")
+            in_list = True
+        if not is_bullet and in_list:
+            html_lines.append("</ul>")
+            in_list = False
+        if is_bullet:
+            content = stripped[2:].lstrip()
+            html_lines.append(f"<li>{_apply_bold_html(content)}</li>")
+        else:
+            if not stripped:
+                html_lines.append("<br>")
+            else:
+                html_lines.append(f"<p style=\"margin:0 0 6px 0;\">{_apply_bold_html(raw)}</p>")
+    if in_list:
+        html_lines.append("</ul>")
+    body = "\n".join(html_lines)
+    return (
+        "<div style=\"font-family:'Microsoft YaHei Light','Microsoft YaHei',sans-serif;"
+        " font-size:14px; line-height:1.6; color:#1e2433;\">"
+        f"{body}</div>"
+    )
+
+
+def _set_rich_clipboard(text: str):
+    """Copy both富文本和纯文本，方便粘贴到 PPT。"""
+    html_text = _markdownish_to_html(text)
+    mime = QMimeData()
+    if html_text:
+        mime.setHtml(html_text)
+    mime.setText(text or "")
+    QApplication.clipboard().setMimeData(mime)
+
+
 class AITranslationService:
     def __init__(self, settings):
         self.settings = _normalized_ai_settings(settings)
@@ -417,9 +512,9 @@ class AITranslationService:
             return ""
         client = self._ensure_client()
         prompt = (
-            "下面是识别到的英文原文，请把它翻译为简洁流畅的中文：\n\n"
+            "下面是识别到的英文原文，请把它翻译为简洁流畅的中文，保留已有的 **加粗** 标记；若原文没有加粗则正常翻译。\n\n"
             + text.strip()
-            + "\n\n只返回翻译文本。"
+            + "\n\n只返回翻译文本，并保留 **加粗** 结构。"
         )
         response = client.chat.completions.create(
             model=self.settings["model"].strip(),
@@ -1464,10 +1559,10 @@ class TranslationTab(QWidget):
         self.copy_both_btn.setEnabled(has_original or has_translation)
 
     def _copy_translation(self):
-        QApplication.clipboard().setText(self.translation_edit.toPlainText())
+        _set_rich_clipboard(self.translation_edit.toPlainText())
 
     def _copy_original(self):
-        QApplication.clipboard().setText(self.original_edit.toPlainText())
+        _set_rich_clipboard(self.original_edit.toPlainText())
 
     def _copy_combined(self):
         original = self.original_edit.toPlainText()
@@ -1475,10 +1570,10 @@ class TranslationTab(QWidget):
         combined = original or ""
         if translation:
             if combined:
-                combined = f"{combined}\n[{translation}]"
+                combined = f"{combined}\n\n[{translation}]"
             else:
                 combined = f"[{translation}]"
-        QApplication.clipboard().setText(combined)
+        _set_rich_clipboard(combined)
 
 
 class AITranslationPanel(QWidget):
@@ -5147,6 +5242,7 @@ class ScreenSnapApp(QMainWindow):
 
 
 def main():
+    _ensure_qt_plugins_path()
     guard = SingleInstanceGuard()
     if guard.already_running:
         _notify_instance_running()
