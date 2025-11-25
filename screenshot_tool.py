@@ -294,6 +294,9 @@ DEFAULT_AI_SETTINGS = {
     "model": "gpt-4.1-nano",
 }
 TAB_LABEL_MAX_LENGTH = 12
+SELECTION_HIT_MARGIN = 8
+SELECTION_HANDLE_SIZE = 8
+SELECTION_HANDLE_HIT_SIZE = 14
 WAIT_OBJECT_0 = 0x00000000
 WAIT_ABANDONED = 0x00000080
 WAIT_TIMEOUT = 0x00000102
@@ -2372,20 +2375,35 @@ class AnnotationCanvas(QWidget):
             return None
         rect = QRect(rect).normalized()
         rect = rect.intersected(bounds)
-        if rect.width() < min_size or rect.height() < min_size:
+        if rect.isNull():
             return None
-        return rect
-    def _selection_handles(self):
+        if rect.width() < min_size:
+            rect.setWidth(min_size)
+            if rect.right() > bounds.right():
+                rect.moveRight(bounds.right())
+            if rect.left() < bounds.left():
+                rect.moveLeft(bounds.left())
+        if rect.height() < min_size:
+            rect.setHeight(min_size)
+            if rect.bottom() > bounds.bottom():
+                rect.moveBottom(bounds.bottom())
+            if rect.top() < bounds.top():
+                rect.moveTop(bounds.top())
+        rect = rect.intersected(bounds)
+        return rect if not rect.isNull() else None
+
+    def _selection_handle_rects(self, for_hit=False):
         if not self.selection_rect:
             return []
         rect = QRect(self.selection_rect).normalized()
-        half = self.HANDLE_SIZE // 2
+        size = SELECTION_HANDLE_HIT_SIZE if for_hit else SELECTION_HANDLE_SIZE
+        half = size // 2
         points = [rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()]
-        return [QRect(p.x() - half, p.y() - half, self.HANDLE_SIZE, self.HANDLE_SIZE) for p in points]
+        return [QRect(p.x() - half, p.y() - half, size, size) for p in points]
 
     def _selection_handle_hit_test(self, pos: QPoint):
         handles = ['top-left', 'top-right', 'bottom-left', 'bottom-right']
-        for handle_name, handle_rect in zip(handles, self._selection_handles()):
+        for handle_name, handle_rect in zip(handles, self._selection_handle_rects(for_hit=True)):
             if handle_rect.contains(pos):
                 return handle_name
         return None
@@ -2495,20 +2513,29 @@ class AnnotationCanvas(QWidget):
             return
         pos = self._view_to_scene(event.pos())
         if self.tool == Tool.SELECTION:
-            if self.selection_rect and self.selection_rect.contains(pos):
-                handle = self._selection_handle_hit_test(pos)
-                if handle:
-                    self._selection_drag_mode = "resize"
-                    self._selection_handle = handle
-                    self._selection_initial_rect = QRect(self.selection_rect)
-                    self._selection_origin = QPoint(pos)
-                    self._selection_dragging = True
-                else:
+            handle = self._selection_handle_hit_test(pos) if self.selection_rect else None
+            if handle:
+                self._selection_drag_mode = "resize"
+                self._selection_handle = handle
+                self._selection_initial_rect = QRect(self.selection_rect).normalized()
+                self._selection_origin = QPoint(pos)
+                self._selection_dragging = True
+            elif self.selection_rect:
+                expanded = QRect(self.selection_rect).normalized()
+                expanded = expanded.adjusted(-SELECTION_HIT_MARGIN, -SELECTION_HIT_MARGIN, SELECTION_HIT_MARGIN, SELECTION_HIT_MARGIN)
+                if expanded.contains(pos):
                     self._selection_drag_mode = "move"
                     self._selection_dragging = True
                     self._selection_origin = QPoint(pos)
                     self._selection_initial_rect = QRect(self.selection_rect)
                     self._selection_offset = pos - self.selection_rect.topLeft()
+                else:
+                    self.selection_rect = QRect(pos, pos)
+                    self._selection_origin = QPoint(pos)
+                    self._selection_dragging = False
+                    self._selection_drag_mode = "resize"
+                    self._selection_handle = "bottom-right"
+                    self._selection_initial_rect = QRect(self.selection_rect)
             else:
                 self.selection_rect = QRect(pos, pos)
                 self._selection_origin = QPoint(pos)
@@ -2539,14 +2566,20 @@ class AnnotationCanvas(QWidget):
             bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
             if self._selection_drag_mode == "move" and self.selection_rect:
                 top_left = pos - self._selection_offset
-                rect = QRect(top_left, self._selection_initial_rect.size()).normalized()
+                rect = QRect(top_left, self._selection_initial_rect.size())
                 rect = self._clamp_rect_to_bounds(rect, bounds)
             elif self._selection_drag_mode == "resize" and self.selection_rect:
                 delta = pos - self._selection_origin
-                rect = self._resize_rect(self._selection_initial_rect, self._selection_handle, delta, event.modifiers()) 
-                rect = self._clamp_rect_to_bounds(rect, bounds)
+                rect = self._resize_rect(
+                    self._selection_initial_rect,
+                    self._selection_handle,
+                    delta,
+                    event.modifiers(),
+                    min_size=self.MIN_RECT_SIZE,
+                    bounds=bounds,
+                )
             else:
-                rect = QRect(self._selection_origin, pos).normalized()
+                rect = QRect(self._selection_origin, pos)
                 rect = self._clamp_rect_to_bounds(rect, bounds)
             self.selection_rect = rect if rect else None
             self.update()
@@ -2568,6 +2601,7 @@ class AnnotationCanvas(QWidget):
             if self.rect_drag_mode == 'move':
                 rect.translate(delta)
             else:
+                bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
                 if self.creating_new_rect and not self.creating_rect_origin.isNull():
                     eff_pos = QPoint(
                         max(pos.x(), self.creating_rect_origin.x() + 1),
@@ -2575,7 +2609,13 @@ class AnnotationCanvas(QWidget):
                     )
                     rect = QRect(self.creating_rect_origin, eff_pos)
                 else:
-                    rect = self._resize_rect(self.rect_initial_rect, self.rect_drag_handle, delta, event.modifiers())
+                    rect = self._resize_rect(
+                        self.rect_initial_rect,
+                        self.rect_drag_handle,
+                        delta,
+                        event.modifiers(),
+                        bounds=bounds,
+                    )
             rect = rect.normalized()
             if rect.width() > 4 and rect.height() > 4:
                 info['rect'] = rect
@@ -2849,7 +2889,7 @@ class AnnotationCanvas(QWidget):
             painter.setBrush(overlay)
             painter.setPen(QPen(QColor("#0ea5e9"), 1, Qt.DashLine))
             painter.drawRect(self.selection_rect)
-            for handle_rect in self._selection_handles():
+            for handle_rect in self._selection_handle_rects(for_hit=False):
                 painter.setBrush(QColor("#0ea5e9"))
                 painter.setPen(Qt.NoPen)
                 painter.drawRect(handle_rect)
@@ -3025,29 +3065,63 @@ class AnnotationCanvas(QWidget):
                     return idx, handle_name
         return None, None
 
-    def _resize_rect(self, initial_rect: QRect, handle: str, delta: QPoint, modifiers):
-        rect = QRect(initial_rect)
+    def _resize_rect(self, initial_rect: QRect, handle: str, delta: QPoint, modifiers, min_size=None, bounds: QRect = None):
+        """Resize a rect with fixed anchor (opposite corner), avoiding flips/jumps."""
+        if min_size is None:
+            min_size = getattr(self, "MIN_RECT_SIZE", 8)
+        rect0 = QRect(initial_rect).normalized()
         dx, dy = delta.x(), delta.y()
+        l, t, r, b = rect0.left(), rect0.top(), rect0.right(), rect0.bottom()
+
         if handle == 'top-left':
-            rect.setTopLeft(rect.topLeft() + delta)
+            new_l = l + dx
+            new_t = t + dy
+            if bounds:
+                new_l = max(bounds.left(), new_l)
+                new_t = max(bounds.top(), new_t)
+            new_l = min(r - min_size, new_l)
+            new_t = min(b - min_size, new_t)
+            rect = QRect(QPoint(new_l, new_t), QPoint(r, b))
         elif handle == 'top-right':
-            rect.setTopRight(rect.topRight() + QPoint(dx, dy))
+            new_r = r + dx
+            new_t = t + dy
+            if bounds:
+                new_r = min(bounds.right(), new_r)
+                new_t = max(bounds.top(), new_t)
+            new_r = max(l + min_size, new_r)
+            new_t = min(b - min_size, new_t)
+            rect = QRect(QPoint(l, new_t), QPoint(new_r, b))
         elif handle == 'bottom-left':
-            rect.setBottomLeft(rect.bottomLeft() + QPoint(dx, dy))
-        else:
-            rect.setBottomRight(rect.bottomRight() + delta)
+            new_l = l + dx
+            new_b = b + dy
+            if bounds:
+                new_l = max(bounds.left(), new_l)
+                new_b = min(bounds.bottom(), new_b)
+            new_l = min(r - min_size, new_l)
+            new_b = max(t + min_size, new_b)
+            rect = QRect(QPoint(new_l, t), QPoint(r, new_b))
+        else:  # bottom-right
+            new_r = r + dx
+            new_b = b + dy
+            if bounds:
+                new_r = min(bounds.right(), new_r)
+                new_b = min(bounds.bottom(), new_b)
+            new_r = max(l + min_size, new_r)
+            new_b = max(t + min_size, new_b)
+            rect = QRect(QPoint(l, t), QPoint(new_r, new_b))
+
         if modifiers & Qt.ControlModifier:
-            width = rect.width()
-            height = rect.height()
-            size = min(abs(width), abs(height))
-            if width < 0:
-                rect.setLeft(rect.right() - size)
-            else:
-                rect.setRight(rect.left() + size)
-            if height < 0:
-                rect.setTop(rect.bottom() - size)
-            else:
-                rect.setBottom(rect.top() + size)
+            w = rect.width()
+            h = rect.height()
+            size = min(w, h)
+            if handle == 'top-left':
+                rect = QRect(QPoint(rect.right() - size, rect.bottom() - size), rect.bottomRight())
+            elif handle == 'top-right':
+                rect = QRect(QPoint(rect.left(), rect.bottom() - size), QPoint(rect.left() + size, rect.bottom()))
+            elif handle == 'bottom-left':
+                rect = QRect(QPoint(rect.right() - size, rect.top()), QPoint(rect.right(), rect.top() + size))
+            else:  # bottom-right
+                rect.setSize(QSize(size, size))
         return rect
 
     def _set_hover_marker(self, idx):
