@@ -1892,6 +1892,7 @@ class AnnotationCanvas(QWidget):
         self.creating_new_rect = False
         self.creating_rect_origin = QPoint()
         self._checker_brush = None
+        self._image_undo_stack = []
         self._marker_dragging = False
         self._text_dragging = False
         self._text_drag_index = None
@@ -2411,10 +2412,21 @@ class AnnotationCanvas(QWidget):
                 return handle_name
         return None
 
+    def _push_image_state(self):
+        """Save current pixmap for undo (limited stack)."""
+        try:
+            snapshot = self.base_pixmap.copy()
+        except Exception:
+            return
+        self._image_undo_stack.append(snapshot)
+        if len(self._image_undo_stack) > 5:
+            self._image_undo_stack.pop(0)
+
     def clear_selection_pixels(self):
         rect = self._selection_bounds()
         if rect is None:
             return False
+        self._push_image_state()
         image = self.base_pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
         painter = QPainter(image)
         painter.setCompositionMode(QPainter.CompositionMode_Clear)
@@ -2434,10 +2446,13 @@ class AnnotationCanvas(QWidget):
         rect = self._selection_bounds()
         if rect is None:
             return False
-        painter = QPainter(self.base_pixmap)
+        self._push_image_state()
+        image = self.base_pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+        painter = QPainter(image)
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         painter.fillRect(rect, color)
         painter.end()
+        self.base_pixmap = QPixmap.fromImage(image)
         self.selection_rect = None
         self.update()
         self.optionsUpdated.emit()
@@ -2485,6 +2500,11 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def undo_last_shape(self):
+        if self._image_undo_stack:
+            self.base_pixmap = self._image_undo_stack.pop()
+            self.update()
+            self.optionsUpdated.emit()
+            return True
         if self.text_items:
             self.text_items.pop()
             self.selected_text_index = None
