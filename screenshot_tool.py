@@ -28,6 +28,7 @@ from PyQt5.QtCore import (
     QByteArray,
     QIODevice,
     QThread,
+    QMimeData,
 )
 from PyQt5.QtGui import (
     QColor,
@@ -35,6 +36,7 @@ from PyQt5.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QImage,
     QFont,
     QFontMetrics,
     QFontDatabase,
@@ -42,6 +44,7 @@ from PyQt5.QtGui import (
     QDesktopServices,
     QKeySequence,
     QCursor,
+    QImage,
 )
 from PyQt5.QtWidgets import (
     QAction,
@@ -547,6 +550,7 @@ class Tool(Enum):
     RECTANGLE = auto()
     MARKER = auto()
     TEXT = auto()
+    SELECTION = auto()
 
 MODIFIER_ORDER = [
     (Qt.ControlModifier, "Ctrl"),
@@ -1656,7 +1660,11 @@ class AnnotationCanvas(QWidget):
 
     def __init__(self, pixmap: QPixmap):
         super().__init__()
-        self.base_pixmap = pixmap
+        if pixmap.isNull():
+            self.base_pixmap = QPixmap()
+        else:
+            image = pixmap.toImage().convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            self.base_pixmap = QPixmap.fromImage(image)
         self._zoom = 1.0
         self._min_zoom = 0.25
         self._max_zoom = 4.0
@@ -1697,6 +1705,14 @@ class AnnotationCanvas(QWidget):
         self.text_font_size = DEFAULT_TEXT_STYLE["size"]
         self.owner_tab = None
         self.selected_text_index = None
+        self.selection_rect = None
+        self._selection_origin = None
+        self._selection_dragging = False
+        self._selection_drag_mode = None  # "move" or "resize"
+        self._selection_handle = None
+        self._selection_initial_rect = None
+        self._selection_offset = QPoint()
+        self.selection_fill_color = QColor("#80000000")
         self._apply_zoom()
 
     def zoom_factor(self):
@@ -2100,6 +2116,8 @@ class AnnotationCanvas(QWidget):
         }
 
     def active_selection_kind(self):
+        if self.selection_rect:
+            return "pixel_selection"
         if self._has_active_text():
             return "text"
         if self._has_active_marker():
@@ -2110,6 +2128,14 @@ class AnnotationCanvas(QWidget):
 
     def clear_active_selection(self, emit=True):
         changed = False
+        if self.selection_rect is not None:
+            self.selection_rect = None
+            self._selection_origin = None
+            self._selection_dragging = False
+            self._selection_drag_mode = None
+            self._selection_handle = None
+            self._selection_initial_rect = None
+            changed = True
         if self.selected_text_index is not None:
             self.selected_text_index = None
             changed = True
@@ -2138,6 +2164,71 @@ class AnnotationCanvas(QWidget):
                 self._notify_text_selection()
         self.update()
         return changed
+
+    def _selection_bounds(self):
+        if self.selection_rect is None:
+            return None
+        rect = QRect(self.selection_rect).normalized()
+        bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
+        rect = rect.intersected(bounds)
+        if rect.width() < 1 or rect.height() < 1:
+            return None
+        return rect
+
+    def _clamp_rect_to_bounds(self, rect: QRect, bounds: QRect, min_size=2):
+        if rect is None:
+            return None
+        rect = QRect(rect).normalized()
+        rect = rect.intersected(bounds)
+        if rect.width() < min_size or rect.height() < min_size:
+            return None
+        return rect
+    def _selection_handles(self):
+        if not self.selection_rect:
+            return []
+        rect = QRect(self.selection_rect).normalized()
+        half = self.HANDLE_SIZE // 2
+        points = [rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()]
+        return [QRect(p.x() - half, p.y() - half, self.HANDLE_SIZE, self.HANDLE_SIZE) for p in points]
+
+    def _selection_handle_hit_test(self, pos: QPoint):
+        handles = ['top-left', 'top-right', 'bottom-left', 'bottom-right']
+        for handle_name, handle_rect in zip(handles, self._selection_handles()):
+            if handle_rect.contains(pos):
+                return handle_name
+        return None
+
+    def clear_selection_pixels(self):
+        rect = self._selection_bounds()
+        if rect is None:
+            return False
+        painter = QPainter(self.base_pixmap)
+        painter.setCompositionMode(QPainter.CompositionMode_Clear)
+        painter.fillRect(rect, Qt.transparent)
+        painter.end()
+        self.selection_rect = None
+        self.update()
+        self.optionsUpdated.emit()
+        if getattr(self, "owner_tab", None):
+            self.owner_tab.on_canvas_pixels_changed()
+        return True
+
+    def fill_selection_pixels(self, color: QColor):
+        if not color or not color.isValid():
+            return False
+        rect = self._selection_bounds()
+        if rect is None:
+            return False
+        painter = QPainter(self.base_pixmap)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.fillRect(rect, color)
+        painter.end()
+        self.selection_rect = None
+        self.update()
+        self.optionsUpdated.emit()
+        if getattr(self, "owner_tab", None):
+            self.owner_tab.on_canvas_pixels_changed()
+        return True
 
     def delete_selected_shape(self):
         if self._has_active_text():
@@ -2210,6 +2301,35 @@ class AnnotationCanvas(QWidget):
         if event.button() != Qt.LeftButton:
             return
         pos = self._view_to_scene(event.pos())
+        if self.tool == Tool.SELECTION:
+            if self.selection_rect and self.selection_rect.contains(pos):
+                handle = self._selection_handle_hit_test(pos)
+                if handle:
+                    self._selection_drag_mode = "resize"
+                    self._selection_handle = handle
+                    self._selection_initial_rect = QRect(self.selection_rect)
+                    self._selection_origin = QPoint(pos)
+                    self._selection_dragging = True
+                else:
+                    self._selection_drag_mode = "move"
+                    self._selection_dragging = True
+                    self._selection_origin = QPoint(pos)
+                    self._selection_initial_rect = QRect(self.selection_rect)
+                    self._selection_offset = pos - self.selection_rect.topLeft()
+            else:
+                self.selection_rect = QRect(pos, pos)
+                self._selection_origin = QPoint(pos)
+                self._selection_dragging = False
+                self._selection_drag_mode = "resize"
+                self._selection_handle = "bottom-right"
+                self._selection_initial_rect = QRect(self.selection_rect)
+            self.selected_marker_index = None
+            self.selected_rectangle_index = None
+            self.selected_text_index = None
+            self._marker_dragging = False
+            self._text_dragging = False
+            self.update()
+            return
         if self._handle_rect_press(pos, allow_creation=False, handles_only=True):
             return
         if self._handle_text_press(pos, allow_creation=self.tool == Tool.TEXT):
@@ -2222,6 +2342,22 @@ class AnnotationCanvas(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = self._view_to_scene(event.pos())
+        if self.tool == Tool.SELECTION and self._selection_origin is not None:
+            bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
+            if self._selection_drag_mode == "move" and self.selection_rect:
+                top_left = pos - self._selection_offset
+                rect = QRect(top_left, self._selection_initial_rect.size()).normalized()
+                rect = self._clamp_rect_to_bounds(rect, bounds)
+            elif self._selection_drag_mode == "resize" and self.selection_rect:
+                delta = pos - self._selection_origin
+                rect = self._resize_rect(self._selection_initial_rect, self._selection_handle, delta, event.modifiers()) 
+                rect = self._clamp_rect_to_bounds(rect, bounds)
+            else:
+                rect = QRect(self._selection_origin, pos).normalized()
+                rect = self._clamp_rect_to_bounds(rect, bounds)
+            self.selection_rect = rect if rect else None
+            self.update()
+            return
         if self._text_dragging and self._text_drag_index is not None:
             item = self.text_items[self._text_drag_index]
             item["pos"] = QPoint(pos - self._text_drag_offset)
@@ -2251,6 +2387,32 @@ class AnnotationCanvas(QWidget):
         if event.button() != Qt.LeftButton:
             return
         pos = self._view_to_scene(event.pos())
+        if self.tool == Tool.SELECTION and self._selection_origin is not None:
+            bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
+            if self._selection_drag_mode == "move" and self.selection_rect:
+                rect = QRect(self.selection_rect).intersected(bounds)
+                self.selection_rect = rect if rect.isValid() else None
+            elif self._selection_drag_mode == "resize" and self.selection_rect:
+                rect = QRect(self.selection_rect).normalized().intersected(bounds)
+                rect = self._clamp_rect_to_bounds(rect, bounds)
+                self.selection_rect = rect if rect else None
+            else:
+                rect = QRect(self._selection_origin, pos).normalized().intersected(bounds)
+                self.selection_rect = rect if rect and rect.width() >= 2 and rect.height() >= 2 else None
+            if self.selection_rect is None:
+                # No valid selection retained
+                self._selection_origin = None
+                self._selection_dragging = False
+                self._selection_drag_mode = None
+                self._selection_handle = None
+                self.update()
+                return
+            self._selection_origin = None
+            self._selection_dragging = False
+            self._selection_drag_mode = None
+            self._selection_handle = None
+            self.update()
+            return
         if self.dragging_marker_index is not None:
             self._end_marker_drag()
             self.dragging_marker_index = None
@@ -2273,6 +2435,8 @@ class AnnotationCanvas(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() != Qt.LeftButton:
+            return
+        if self.tool == Tool.SELECTION:
             return
         pos = self._view_to_scene(event.pos())
         idx = self._text_hit_test(pos)
@@ -2479,6 +2643,15 @@ class AnnotationCanvas(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.scale(self._zoom, self._zoom)
         painter.drawPixmap(0, 0, self.base_pixmap)
+        if self.selection_rect and self.selection_rect.width() > 1 and self.selection_rect.height() > 1:
+            overlay = QColor("#0ea5e980")
+            painter.setBrush(overlay)
+            painter.setPen(QPen(QColor("#0ea5e9"), 1, Qt.DashLine))
+            painter.drawRect(self.selection_rect)
+            for handle_rect in self._selection_handles():
+                painter.setBrush(QColor("#0ea5e9"))
+                painter.setPen(Qt.NoPen)
+                painter.drawRect(handle_rect)
         for idx, info in enumerate(self.rectangles):
             painter.setBrush(info['fill'])
             if info['border_enabled']:
@@ -2684,6 +2857,20 @@ class AnnotationCanvas(QWidget):
     def _update_pointer_feedback(self, pos: QPoint):
         if self._marker_dragging:
             return
+        if self.tool == Tool.SELECTION:
+            if self.selection_rect:
+                handle = self._selection_handle_hit_test(pos)
+                if handle in ("top-left", "bottom-right"):
+                    self._update_cursor(Qt.SizeFDiagCursor)
+                    return
+                if handle in ("top-right", "bottom-left"):
+                    self._update_cursor(Qt.SizeBDiagCursor)
+                    return
+                if self.selection_rect.contains(pos):
+                    self._update_cursor(Qt.SizeAllCursor)
+                    return
+            self._update_cursor(Qt.CrossCursor)
+            return
         allow_rect_cursor = self.tool != Tool.MARKER
         if allow_rect_cursor:
             idx, handle = self._rect_handle_hit_test(pos)
@@ -2713,6 +2900,8 @@ class AnnotationCanvas(QWidget):
             self._update_cursor(Qt.CrossCursor)
         elif self.tool == Tool.TEXT:
             self._update_cursor(Qt.IBeamCursor)
+        elif self.tool == Tool.SELECTION:
+            self._update_cursor(Qt.CrossCursor)
         else:
             self._update_cursor(Qt.ArrowCursor)
 
@@ -2794,6 +2983,14 @@ class AnnotationTab(QWidget):
                 background: #2ed3a3;
                 color: #0c1c27;
             }
+            QToolBar#AnnotationToolbar QToolButton#Tool_select {
+                background: rgba(14,165,233,0.18);
+                color: #075985;
+            }
+            QToolBar#AnnotationToolbar QToolButton#Tool_select:checked {
+                background: #0ea5e9;
+                color: #041724;
+            }
             QToolBar#AnnotationToolbar QToolButton#Tool_text {
                 background: rgba(247,181,0,0.18);
                 color: #7a5007;
@@ -2829,6 +3026,14 @@ class AnnotationTab(QWidget):
         if text_button:
             text_button.setObjectName("Tool_text")
 
+        select_action = QAction("选区", self)
+        select_action.setCheckable(True)
+        select_action.triggered.connect(lambda: self._set_tool(Tool.SELECTION))
+        toolbar.addAction(select_action)
+        select_button = toolbar.widgetForAction(select_action)
+        if select_button:
+            select_button.setObjectName("Tool_select")
+
         clear_action = QAction("清除标注", self)
         clear_action.triggered.connect(self.canvas.clear_annotations)
         toolbar.addAction(clear_action)
@@ -2853,9 +3058,11 @@ class AnnotationTab(QWidget):
             Tool.RECTANGLE: rect_action,
             Tool.MARKER: marker_action,
             Tool.TEXT: text_action,
+            Tool.SELECTION: select_action,
         }
         layout.addWidget(toolbar)
 
+        self.selection_panel = SelectionOptionsPanel(self.canvas)
         self.marker_panel = MarkerOptionsPanel(self.canvas)
         self.rectangle_panel = RectangleOptionsPanel(self.canvas)
         self.text_panel = TextOptionsPanel(self)
@@ -2865,17 +3072,20 @@ class AnnotationTab(QWidget):
         self.panel_stack = QStackedWidget()
         self.panel_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.panel_stack.addWidget(self._options_placeholder)
+        self.panel_stack.addWidget(self.selection_panel)
         self.panel_stack.addWidget(self.marker_panel)
         self.panel_stack.addWidget(self.rectangle_panel)
         self.panel_stack.addWidget(self.text_panel)
 
         stack_height = max(
+            self.selection_panel.sizeHint().height(),
             self.marker_panel.sizeHint().height(),
             self.rectangle_panel.sizeHint().height(),
             self.text_panel.sizeHint().height(),
         )
         self.panel_stack.setFixedHeight(stack_height)
         self._options_placeholder.setFixedHeight(stack_height)
+        self.selection_panel.setMinimumHeight(stack_height)
         self.marker_panel.setMinimumHeight(stack_height)
         self.rectangle_panel.setMinimumHeight(stack_height)
         self.text_panel.setMinimumHeight(stack_height)
@@ -2944,6 +3154,10 @@ class AnnotationTab(QWidget):
             self.canvas.apply_text_style(item)
         else:
             self._apply_text_defaults_to_canvas()
+        self.on_canvas_pixels_changed()
+
+    def on_canvas_pixels_changed(self):
+        self._mark_dirty()
 
     def on_text_color_changed(self, color: QColor):
         if self.canvas._has_active_text():
@@ -3032,10 +3246,10 @@ class AnnotationTab(QWidget):
     def _auto_save_pixmap(self, pixmap: QPixmap):
         os.makedirs(self.save_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"screenshot_{timestamp}.jpg"
+        filename = f"screenshot_{timestamp}.png"
         path = os.path.join(self.save_dir, filename)
         if self.auto_save_enabled:
-            pixmap.save(path, "JPG", self.image_quality)
+            pixmap.save(path, "PNG")
         return path
 
     def save_annotated_image(self):
@@ -3043,8 +3257,8 @@ class AnnotationTab(QWidget):
             self.canvas.flatten_all_annotations()
         annotated = self.canvas.export_pixmap()
         base, _ = os.path.splitext(os.path.basename(self.auto_saved_path))
-        annotated_path = os.path.join(self.save_dir, f"{base}_annotated.jpg")
-        if annotated.save(annotated_path, "JPG", self.image_quality):
+        annotated_path = os.path.join(self.save_dir, f"{base}_annotated.png")
+        if annotated.save(annotated_path, "PNG", self.image_quality):
             self.status_label.setText(f"标注图已保存: {annotated_path}")
             self._set_dirty(False)
             return True
@@ -3066,7 +3280,7 @@ class AnnotationTab(QWidget):
     
     def _handle_escape(self):
         self.canvas.clear_active_selection()
-        if self._current_tool in (Tool.MARKER, Tool.TEXT):
+        if self._current_tool in (Tool.MARKER, Tool.TEXT, Tool.SELECTION):
             self._set_tool(Tool.NONE)
 
     def _on_zoom_changed(self, factor):
@@ -3076,7 +3290,9 @@ class AnnotationTab(QWidget):
 
     def _update_panel_visibility(self, preferred=None):
         kind = self.canvas.active_selection_kind()
-        if kind == "marker":
+        if kind == "pixel_selection":
+            target = Tool.SELECTION
+        elif kind == "marker":
             target = Tool.MARKER
         elif kind == "rectangle":
             target = Tool.RECTANGLE
@@ -3090,16 +3306,21 @@ class AnnotationTab(QWidget):
         elif target == Tool.RECTANGLE:
             self.panel_stack.setCurrentWidget(self.rectangle_panel)
             self._set_panel_active_state(rectangle=True)
+        elif target == Tool.SELECTION:
+            self.panel_stack.setCurrentWidget(self.selection_panel)
+            self._set_panel_active_state(selection=True)
         elif target == Tool.TEXT:
             self.panel_stack.setCurrentWidget(self.text_panel)
             self._set_panel_active_state(text=True)
         else:
             self.panel_stack.setCurrentWidget(self._options_placeholder)
             self._set_panel_active_state()
-        tracking = target if target in (Tool.MARKER, Tool.RECTANGLE, Tool.TEXT) else Tool.NONE
+        tracking = target if target in (Tool.MARKER, Tool.RECTANGLE, Tool.TEXT, Tool.SELECTION) else Tool.NONE
         self._sync_tool_action_checks(tracking)
 
-    def _set_panel_active_state(self, marker=False, rectangle=False, text=False):
+    def _set_panel_active_state(self, marker=False, rectangle=False, text=False, selection=False):
+        if hasattr(self.selection_panel, "setVisible"):
+            self.selection_panel.setVisible(bool(selection))
         if hasattr(self.marker_panel, "set_panel_active"):
             self.marker_panel.set_panel_active(bool(marker))
         if hasattr(self.rectangle_panel, "set_panel_active"):
@@ -3178,13 +3399,29 @@ class AnnotationTab(QWidget):
     def _copy_to_clipboard(self):
         self.canvas.flatten_all_annotations()
         pix = self.canvas.export_pixmap()
-        QApplication.clipboard().setPixmap(pix)
-        self.status_label.setText("已平化并复制到剪贴板")
+        image = pix.toImage().convertToFormat(QImage.Format_ARGB32)
+        buffer = QBuffer()
+        buffer.open(QIODevice.WriteOnly)
+        image.save(buffer, "PNG")
+        png_bytes = bytes(buffer.data())
+        buffer.close()
+        mime = QMimeData()
+        mime.setImageData(image)
+        mime.setData("image/png", png_bytes)
+        clipboard = QApplication.clipboard()
+        clipboard.setMimeData(mime)
+        clipboard.setImage(image)
+        self.status_label.setText("已复制到剪贴板")
         self._mark_dirty()
 
     def _delete_selected(self):
+        if self.canvas.selection_rect:
+            if self.canvas.clear_selection_pixels():
+                self.status_label.setText("选区已清空")
+                self._mark_dirty()
+            return
         if self.canvas.delete_selected_shape():
-            self.status_label.setText("已删除当前选择")
+            self.status_label.setText("删除了当前选中")
             self._mark_dirty()
         else:
             QApplication.beep()
@@ -3213,6 +3450,51 @@ class AnnotationTab(QWidget):
         if reply == QMessageBox.Cancel:
             return False
         return True
+
+
+class SelectionOptionsPanel(QFrame):
+    def __init__(self, canvas: AnnotationCanvas):
+        super().__init__()
+        self.canvas = canvas
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+
+        title = QLabel("选区操作")
+        title.setStyleSheet("font-weight: 700; color: #0f172a;")
+        layout.addWidget(title)
+
+        self.color_btn = QPushButton("填充颜色")
+        self.color_btn.clicked.connect(self._choose_color)
+        self._update_color_button()
+        layout.addWidget(self.color_btn)
+
+        fill_btn = QPushButton("填充选区")
+        fill_btn.clicked.connect(lambda: self.canvas.fill_selection_pixels(self.canvas.selection_fill_color))
+        layout.addWidget(fill_btn)
+
+        clear_btn = QPushButton("清空选区")
+        clear_btn.clicked.connect(self.canvas.clear_selection_pixels)
+        layout.addWidget(clear_btn)
+
+        hint = QLabel("拖拽创建选区后，可清除为透明或填充颜色。")
+        hint.setStyleSheet("color: #6b7280;")
+        layout.addWidget(hint, 1)
+
+    def _update_color_button(self):
+        color = self.canvas.selection_fill_color
+        if not color or not color.isValid():
+            color = QColor("#00000080")
+            self.canvas.selection_fill_color = color
+        self.color_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {color.name(QColor.HexArgb)}; color: #0f172a; border: 1px solid #cbd5e1; padding: 6px 10px; }}"
+        )
+
+    def _choose_color(self):
+        color = QColorDialog.getColor(self.canvas.selection_fill_color, self, "选择填充颜色")
+        if color.isValid():
+            self.canvas.selection_fill_color = QColor(color)
+            self._update_color_button()
 
 
 class MarkerOptionsPanel(QFrame):
