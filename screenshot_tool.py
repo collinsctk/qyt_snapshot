@@ -4640,14 +4640,43 @@ class CaptureOverlay(QWidget):
             return
         src_half = 16
         size = QSize(src_half * 2, src_half * 2)
-        x = max(src_half, min(self.cursor_pos.x(), self.width() - src_half - 1))
-        y = max(src_half, min(self.cursor_pos.y(), self.height() - src_half - 1))
-        logical_rect = QRect(QPoint(x - src_half, y - src_half), size)
-        source_rect = self._device_rect(logical_rect)
+        logical_rect = QRect(
+            QPoint(self.cursor_pos.x() - src_half, self.cursor_pos.y() - src_half),
+            size,
+        )
+        desired_device_rect = self._logical_device_rect(logical_rect)
+        source_rect = desired_device_rect.intersected(self.screenshot.rect())
+        if source_rect.isEmpty():
+            return
+
+        pad_left = max(0, source_rect.x() - desired_device_rect.x())
+        pad_top = max(0, source_rect.y() - desired_device_rect.y())
+
+        target_width = desired_device_rect.width()
+        target_height = desired_device_rect.height()
+        if target_width <= 0 or target_height <= 0:
+            return
+
+        # Pad out-of-bounds areas so the magnifier center still points at the real cursor on screen edges.
+        base_color = self.screenshot.toImage().pixelColor(
+            max(0, min(source_rect.x(), self.screenshot.width() - 1)),
+            max(0, min(source_rect.y(), self.screenshot.height() - 1)),
+        )
+        padded = QImage(QSize(target_width, target_height), QImage.Format_ARGB32)
+        padded.fill(base_color)
+
         snippet = self.screenshot.copy(source_rect)
+        target_x = max(0, min(pad_left, target_width - snippet.width()))
+        target_y = max(0, min(pad_top, target_height - snippet.height()))
+        painter_img = QPainter(padded)
+        painter_img.drawPixmap(target_x, target_y, snippet)
+        painter_img.end()
+
         zoom = 5
         dest_size = QSize(size.width() * zoom, size.height() * zoom)
-        magnified = snippet.scaled(dest_size, Qt.KeepAspectRatio, Qt.FastTransformation)
+        magnified = QPixmap.fromImage(padded).scaled(
+            dest_size, Qt.KeepAspectRatio, Qt.FastTransformation
+        )
 
         margin = 20
         dest_top_left = QPoint(self.cursor_pos.x() + margin, self.cursor_pos.y() + margin)
@@ -4670,14 +4699,17 @@ class CaptureOverlay(QWidget):
         painter.drawLine(dest_rect.left(), center_y, dest_rect.right(), center_y)
 
     def _device_rect(self, logical_rect: QRect):
+        rect = self._logical_device_rect(logical_rect)
+        return self._clamp_to_pixmap(rect)
+
+    def _logical_device_rect(self, logical_rect: QRect):
         if logical_rect is None:
             return QRect()
         x = int(round(logical_rect.x() * self._scale_x))
         y = int(round(logical_rect.y() * self._scale_y))
         w = max(1, int(round(logical_rect.width() * self._scale_x)))
         h = max(1, int(round(logical_rect.height() * self._scale_y)))
-        rect = QRect(x, y, w, h)
-        return self._clamp_to_pixmap(rect)
+        return QRect(x, y, w, h)
 
     def _sync_cursor_position(self, force=False):
         global_pos = QCursor.pos()
