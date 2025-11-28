@@ -2586,6 +2586,7 @@ class AnnotationCanvas(QWidget):
         self.clear_active_selection()
 
     def mouseMoveEvent(self, event):
+        self._maybe_auto_scroll(event)
         pos = self._view_to_scene(event.pos())
         if self.tool == Tool.SELECTION and self._selection_origin is not None:
             bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
@@ -3227,6 +3228,27 @@ class AnnotationCanvas(QWidget):
     def _update_cursor(self, cursor_shape):
         self.setCursor(cursor_shape)
 
+    def _is_dragging_operation_active(self):
+        if self.tool == Tool.SELECTION and self._selection_origin is not None:
+            return True
+        if self._text_dragging:
+            return True
+        if self.dragging_marker_index is not None and not self.markers_flattened:
+            return True
+        if self.rect_drag_mode and self.selected_rectangle_index is not None:
+            return True
+        return False
+
+    def _maybe_auto_scroll(self, event):
+        if not self._is_dragging_operation_active():
+            return
+        owner = getattr(self, "owner_tab", None)
+        if owner and hasattr(owner, "request_canvas_autoscroll"):
+            try:
+                owner.request_canvas_autoscroll(event.pos())
+            except Exception:
+                pass
+
 class AnnotationTab(QWidget):
     dirtyStateChanged = pyqtSignal(bool)
     def __init__(
@@ -3715,6 +3737,46 @@ class AnnotationTab(QWidget):
     def _duplicate_active_shape(self):
         if not self.canvas.duplicate_active_shape():
             QApplication.beep()
+
+    def request_canvas_autoscroll(self, canvas_pos: QPoint):
+        scroll = getattr(self, "_scroll_area", None)
+        if not scroll or not hasattr(scroll, "viewport"):
+            return
+        viewport = scroll.viewport()
+        if viewport is None:
+            return
+        view_pos = self.canvas.mapTo(viewport, canvas_pos)
+        margin = 36
+        max_step = 28
+        width = max(1, viewport.width())
+        height = max(1, viewport.height())
+        right_edge = max(margin, width - margin)
+        bottom_edge = max(margin, height - margin)
+
+        dx = 0
+        dy = 0
+        if view_pos.x() < margin:
+            dx = view_pos.x() - margin
+        elif view_pos.x() > right_edge:
+            dx = view_pos.x() - right_edge
+        if view_pos.y() < margin:
+            dy = view_pos.y() - margin
+        elif view_pos.y() > bottom_edge:
+            dy = view_pos.y() - bottom_edge
+
+        if dx == 0 and dy == 0:
+            return
+
+        def _step(delta):
+            magnitude = min(max_step, int(abs(delta) * 0.6) + 2)
+            return -magnitude if delta < 0 else magnitude
+
+        if dx:
+            hbar = scroll.horizontalScrollBar()
+            hbar.setValue(hbar.value() + _step(dx))
+        if dy:
+            vbar = scroll.verticalScrollBar()
+            vbar.setValue(vbar.value() + _step(dy))
 
     def eventFilter(self, obj, event):
         viewport = getattr(self, "_scroll_area", None)
@@ -4649,9 +4711,6 @@ class CaptureOverlay(QWidget):
         if source_rect.isEmpty():
             return
 
-        pad_left = max(0, source_rect.x() - desired_device_rect.x())
-        pad_top = max(0, source_rect.y() - desired_device_rect.y())
-
         target_width = desired_device_rect.width()
         target_height = desired_device_rect.height()
         if target_width <= 0 or target_height <= 0:
@@ -4666,8 +4725,11 @@ class CaptureOverlay(QWidget):
         padded.fill(base_color)
 
         snippet = self.screenshot.copy(source_rect)
-        target_x = max(0, min(pad_left, target_width - snippet.width()))
-        target_y = max(0, min(pad_top, target_height - snippet.height()))
+        cursor_device = self._logical_device_point(self.cursor_pos)
+        cursor_offset_x = cursor_device.x() - source_rect.x()
+        cursor_offset_y = cursor_device.y() - source_rect.y()
+        target_x = max(0, min(target_width - snippet.width(), (target_width // 2) - cursor_offset_x))
+        target_y = max(0, min(target_height - snippet.height(), (target_height // 2) - cursor_offset_y))
         painter_img = QPainter(padded)
         painter_img.drawPixmap(target_x, target_y, snippet)
         painter_img.end()
@@ -4710,6 +4772,13 @@ class CaptureOverlay(QWidget):
         w = max(1, int(round(logical_rect.width() * self._scale_x)))
         h = max(1, int(round(logical_rect.height() * self._scale_y)))
         return QRect(x, y, w, h)
+
+    def _logical_device_point(self, logical_point: QPoint):
+        if logical_point is None:
+            return QPoint()
+        x = int(round(logical_point.x() * self._scale_x))
+        y = int(round(logical_point.y() * self._scale_y))
+        return QPoint(x, y)
 
     def _sync_cursor_position(self, force=False):
         global_pos = QCursor.pos()
