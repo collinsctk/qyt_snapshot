@@ -1892,7 +1892,7 @@ class AnnotationCanvas(QWidget):
         self.creating_new_rect = False
         self.creating_rect_origin = QPoint()
         self._checker_brush = None
-        self._image_undo_stack = []
+        self._undo_stack = []
         self._marker_dragging = False
         self._text_dragging = False
         self._text_drag_index = None
@@ -1973,6 +1973,7 @@ class AnnotationCanvas(QWidget):
         self._update_default_cursor()
 
     def clear_annotations(self):
+        self._push_undo_state()
         self.rectangles.clear()
         self.markers.clear()
         self.next_marker_number = 1
@@ -2004,6 +2005,7 @@ class AnnotationCanvas(QWidget):
 
     def set_marker_color(self, color: QColor):
         if color.isValid():
+            self._push_undo_state()
             self.marker_fill_color = color
             if self._has_active_marker():
                 self.markers[self.selected_marker_index]['fill'] = QColor(color)
@@ -2011,6 +2013,7 @@ class AnnotationCanvas(QWidget):
             self.optionsUpdated.emit()
 
     def set_marker_size(self, size: int):
+        self._push_undo_state()
         self.marker_size = max(10, min(120, size))
         if self._has_active_marker():
             self.markers[self.selected_marker_index]['size'] = self.marker_size
@@ -2018,16 +2021,19 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def set_next_marker_number(self, number: int):
+        self._push_undo_state()
         self.next_marker_number = max(1, number)
         self.optionsUpdated.emit()
 
     def set_current_marker_number(self, number: int):
         if self._has_active_marker():
+            self._push_undo_state()
             self.markers[self.selected_marker_index]['number'] = max(1, number)
             self.update()
             self.optionsUpdated.emit()
 
     def set_marker_border_enabled(self, enabled: bool):
+        self._push_undo_state()
         self.marker_border_enabled = enabled
         if self._has_active_marker():
             self.markers[self.selected_marker_index]['border_enabled'] = enabled
@@ -2036,6 +2042,7 @@ class AnnotationCanvas(QWidget):
 
     def set_marker_border_color(self, color: QColor):
         if color.isValid():
+            self._push_undo_state()
             self.marker_border_color = color
             if self._has_active_marker():
                 self.markers[self.selected_marker_index]['border_color'] = QColor(color)
@@ -2043,6 +2050,7 @@ class AnnotationCanvas(QWidget):
             self.optionsUpdated.emit()
 
     def set_marker_font_ratio(self, ratio: float):
+        self._push_undo_state()
         self.marker_font_ratio = max(0.3, min(1.2, ratio))
         if self._has_active_marker():
             self.markers[self.selected_marker_index]['font_ratio'] = self.marker_font_ratio
@@ -2050,6 +2058,7 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def flatten_markers(self):
+        self._push_undo_state()
         self.dragging_marker_index = None
         self.markers_flattened = True
         self.selected_marker_index = None
@@ -2060,6 +2069,7 @@ class AnnotationCanvas(QWidget):
     def duplicate_marker(self):
         if not self._has_active_marker():
             return False
+        self._push_undo_state()
         marker = dict(self.markers[self.selected_marker_index])
         marker['pos'] = marker['pos'] + QPoint(12, 12)
         self.markers.append(marker)
@@ -2083,6 +2093,7 @@ class AnnotationCanvas(QWidget):
 
     def set_rectangle_fill_color(self, color: QColor):
         if color.isValid():
+            self._push_undo_state()
             self.rectangle_fill_color = color
             if self._has_active_rectangle():
                 self.rectangles[self.selected_rectangle_index]['fill'] = QColor(color)
@@ -2091,6 +2102,7 @@ class AnnotationCanvas(QWidget):
 
     def set_rectangle_border_color(self, color: QColor):
         if color.isValid():
+            self._push_undo_state()
             self.rectangle_border_color = color
             if self._has_active_rectangle():
                 self.rectangles[self.selected_rectangle_index]['border'] = QColor(color)
@@ -2098,6 +2110,7 @@ class AnnotationCanvas(QWidget):
             self.optionsUpdated.emit()
 
     def set_rectangle_border_width(self, width: int):
+        self._push_undo_state()
         self.rectangle_border_width = max(1, min(20, width))
         if self._has_active_rectangle():
             self.rectangles[self.selected_rectangle_index]['width'] = self.rectangle_border_width
@@ -2105,6 +2118,7 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def set_rectangle_corner_radius(self, radius: int):
+        self._push_undo_state()
         self.rectangle_corner_radius = max(0, min(60, radius))
         if self._has_active_rectangle():
             self.rectangles[self.selected_rectangle_index]['radius'] = self.rectangle_corner_radius
@@ -2112,6 +2126,7 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def set_rectangle_border_enabled(self, enabled: bool):
+        self._push_undo_state()
         self.rectangle_border_enabled = enabled
         if self._has_active_rectangle():
             self.rectangles[self.selected_rectangle_index]['border_enabled'] = enabled
@@ -2120,6 +2135,7 @@ class AnnotationCanvas(QWidget):
 
     def flatten_rectangle(self):
         if self._has_active_rectangle():
+            self._push_undo_state()
             self.rectangles[self.selected_rectangle_index]['flattened'] = True
             self.selected_rectangle_index = None
             if all(r['flattened'] for r in self.rectangles):
@@ -2130,6 +2146,7 @@ class AnnotationCanvas(QWidget):
     def duplicate_rectangle(self):
         if not self._has_active_rectangle():
             return False
+        self._push_undo_state()
         info = dict(self.rectangles[self.selected_rectangle_index])
         info['rect'] = info['rect'].translated(12, 12)
         info['flattened'] = False
@@ -2223,6 +2240,7 @@ class AnnotationCanvas(QWidget):
     def set_text_color(self, color: QColor):
         if not color or not color.isValid():
             return
+        self._push_undo_state()
         self.text_color = QColor(color)
         if self._has_active_text():
             self.text_items[self.selected_text_index]["color"] = QColor(color)
@@ -2237,6 +2255,7 @@ class AnnotationCanvas(QWidget):
         clamped = max(8, min(72, size))
         if abs(clamped - self.text_font_size) < 0.1:
             return
+        self._push_undo_state()
         self.text_font_size = clamped
         if self._has_active_text():
             self.text_items[self.selected_text_index]["font_size"] = clamped
@@ -2247,6 +2266,7 @@ class AnnotationCanvas(QWidget):
         family = _sanitize_font_family(family)
         if not family:
             return
+        self._push_undo_state()
         self.text_font_family = family
         if self._has_active_text():
             self.text_items[self.selected_text_index]["font_family"] = family
@@ -2256,6 +2276,7 @@ class AnnotationCanvas(QWidget):
     def set_text_background_color(self, color: QColor):
         if not color or not color.isValid():
             return
+        self._push_undo_state()
         self.text_background_color = QColor(color)
         if self._has_active_text():
             self.text_items[self.selected_text_index]["background"] = QColor(color)
@@ -2265,6 +2286,7 @@ class AnnotationCanvas(QWidget):
     def update_selected_text_color(self, color: QColor):
         if not color or not color.isValid() or not self._has_active_text():
             return
+        self._push_undo_state()
         item = self.text_items[self.selected_text_index]
         item["color"] = QColor(color)
         self.text_color = QColor(color)
@@ -2274,6 +2296,7 @@ class AnnotationCanvas(QWidget):
     def update_selected_text_background(self, color: QColor):
         if not color or not color.isValid() or not self._has_active_text():
             return
+        self._push_undo_state()
         item = self.text_items[self.selected_text_index]
         item["background"] = QColor(color)
         self.text_background_color = QColor(color)
@@ -2286,6 +2309,7 @@ class AnnotationCanvas(QWidget):
         family = _sanitize_font_family(family)
         if not family:
             return
+        self._push_undo_state()
         item = self.text_items[self.selected_text_index]
         item["font_family"] = family
         self.text_font_family = family
@@ -2300,6 +2324,7 @@ class AnnotationCanvas(QWidget):
         except (TypeError, ValueError):
             return
         size = max(8, min(72, size))
+        self._push_undo_state()
         item = self.text_items[self.selected_text_index]
         item["font_size"] = size
         self.text_font_size = size
@@ -2412,21 +2437,140 @@ class AnnotationCanvas(QWidget):
                 return handle_name
         return None
 
-    def _push_image_state(self):
-        """Save current pixmap for undo (limited stack)."""
+    def _clone_marker(self, marker):
+        return {
+            "pos": QPoint(marker["pos"]),
+            "number": marker["number"],
+            "fill": QColor(marker["fill"]),
+            "size": marker["size"],
+            "border_enabled": marker.get("border_enabled", True),
+            "border_color": QColor(marker.get("border_color", self.marker_border_color)),
+            "font_ratio": marker.get("font_ratio", self.marker_font_ratio),
+        }
+
+    def _clone_rectangle(self, info):
+        return {
+            "rect": QRect(info["rect"]),
+            "fill": QColor(info["fill"]),
+            "border": QColor(info["border"]),
+            "border_enabled": info.get("border_enabled", True),
+            "width": info.get("width", self.rectangle_border_width),
+            "radius": info.get("radius", self.rectangle_corner_radius),
+            "flattened": info.get("flattened", False),
+        }
+
+    def _clone_text_item(self, item):
+        return {
+            "pos": QPoint(item["pos"]),
+            "text": item["text"],
+            "color": QColor(item.get("color", self.text_color)),
+            "background": QColor(item.get("background", self.text_background_color)),
+            "font_family": item.get("font_family", self.text_font_family),
+            "font_size": item.get("font_size", self.text_font_size),
+        }
+
+    def _snapshot_state(self):
         try:
-            snapshot = self.base_pixmap.copy()
+            base_snapshot = self.base_pixmap.copy()
         except Exception:
+            base_snapshot = QPixmap()
+        return {
+            "base_pixmap": base_snapshot,
+            "markers": [self._clone_marker(m) for m in self.markers],
+            "rectangles": [self._clone_rectangle(r) for r in self.rectangles],
+            "text_items": [self._clone_text_item(t) for t in self.text_items],
+            "selection_rect": QRect(self.selection_rect) if self.selection_rect else None,
+            "markers_flattened": self.markers_flattened,
+            "rectangles_flattened": self.rectangles_flattened,
+            "selected_marker_index": self.selected_marker_index,
+            "selected_rectangle_index": self.selected_rectangle_index,
+            "selected_text_index": self.selected_text_index,
+            "next_marker_number": self.next_marker_number,
+            "marker_style": {
+                "fill": QColor(self.marker_fill_color),
+                "border": QColor(self.marker_border_color),
+                "border_enabled": self.marker_border_enabled,
+                "size": self.marker_size,
+                "font_ratio": self.marker_font_ratio,
+            },
+            "rectangle_style": {
+                "fill": QColor(self.rectangle_fill_color),
+                "border": QColor(self.rectangle_border_color),
+                "border_enabled": self.rectangle_border_enabled,
+                "width": self.rectangle_border_width,
+                "radius": self.rectangle_corner_radius,
+            },
+            "text_style": {
+                "color": QColor(self.text_color),
+                "background": QColor(self.text_background_color),
+                "font": self.text_font_family,
+                "size": self.text_font_size,
+            },
+        }
+
+    def _push_undo_state(self):
+        snapshot = self._snapshot_state()
+        if snapshot:
+            self._undo_stack.append(snapshot)
+
+    def _restore_state(self, state):
+        if not state:
             return
-        self._image_undo_stack.append(snapshot)
-        if len(self._image_undo_stack) > 5:
-            self._image_undo_stack.pop(0)
+        self.base_pixmap = state["base_pixmap"].copy()
+        self.markers = [self._clone_marker(m) for m in state.get("markers", [])]
+        self.rectangles = [self._clone_rectangle(r) for r in state.get("rectangles", [])]
+        self.text_items = [self._clone_text_item(t) for t in state.get("text_items", [])]
+        snap_rect = state.get("selection_rect")
+        self.selection_rect = QRect(snap_rect) if snap_rect else None
+        self.markers_flattened = state.get("markers_flattened", True)
+        self.rectangles_flattened = state.get("rectangles_flattened", True)
+        self.selected_marker_index = state.get("selected_marker_index")
+        self.selected_rectangle_index = state.get("selected_rectangle_index")
+        self.selected_text_index = state.get("selected_text_index")
+        self.next_marker_number = state.get("next_marker_number", self.next_marker_number)
+        marker_style = state.get("marker_style", {})
+        self.marker_fill_color = QColor(marker_style.get("fill", self.marker_fill_color))
+        self.marker_border_color = QColor(marker_style.get("border", self.marker_border_color))
+        self.marker_border_enabled = marker_style.get("border_enabled", self.marker_border_enabled)
+        self.marker_size = marker_style.get("size", self.marker_size)
+        self.marker_font_ratio = marker_style.get("font_ratio", self.marker_font_ratio)
+        rect_style = state.get("rectangle_style", {})
+        self.rectangle_fill_color = QColor(rect_style.get("fill", self.rectangle_fill_color))
+        self.rectangle_border_color = QColor(rect_style.get("border", self.rectangle_border_color))
+        self.rectangle_border_enabled = rect_style.get("border_enabled", self.rectangle_border_enabled)
+        self.rectangle_border_width = rect_style.get("width", self.rectangle_border_width)
+        self.rectangle_corner_radius = rect_style.get("radius", self.rectangle_corner_radius)
+        text_style = state.get("text_style", {})
+        self.text_color = QColor(text_style.get("color", self.text_color))
+        self.text_background_color = QColor(text_style.get("background", self.text_background_color))
+        self.text_font_family = text_style.get("font", self.text_font_family)
+        self.text_font_size = text_style.get("size", self.text_font_size)
+        self._selection_origin = None
+        self._selection_dragging = False
+        self._selection_drag_mode = None
+        self._selection_handle = None
+        self._selection_initial_rect = None
+        self._selection_offset = QPoint()
+        self.dragging_marker_index = None
+        self._marker_dragging = False
+        self.hover_marker_index = None
+        self.rect_drag_mode = None
+        self.rect_drag_handle = None
+        self.rect_initial_rect = QRect()
+        self.rect_drag_origin = QPoint()
+        self.creating_new_rect = False
+        self.creating_rect_origin = QPoint()
+        self._text_dragging = False
+        self._text_drag_index = None
+        self._text_drag_offset = QPoint()
+        self.update()
+        self.optionsUpdated.emit()
 
     def clear_selection_pixels(self):
         rect = self._selection_bounds()
         if rect is None:
             return False
-        self._push_image_state()
+        self._push_undo_state()
         image = self.base_pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
         painter = QPainter(image)
         painter.setCompositionMode(QPainter.CompositionMode_Clear)
@@ -2446,7 +2590,7 @@ class AnnotationCanvas(QWidget):
         rect = self._selection_bounds()
         if rect is None:
             return False
-        self._push_image_state()
+        self._push_undo_state()
         image = self.base_pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
         painter = QPainter(image)
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
@@ -2462,12 +2606,14 @@ class AnnotationCanvas(QWidget):
 
     def delete_selected_shape(self):
         if self._has_active_text():
+            self._push_undo_state()
             self.text_items.pop(self.selected_text_index)
             self.selected_text_index = None
             self.optionsUpdated.emit()
             self.update()
             return True
         if self._has_active_marker():
+            self._push_undo_state()
             self.markers.pop(self.selected_marker_index)
             self.selected_marker_index = None
             self.dragging_marker_index = None
@@ -2476,6 +2622,7 @@ class AnnotationCanvas(QWidget):
             self.optionsUpdated.emit()
             return True
         if self._has_active_rectangle():
+            self._push_undo_state()
             self.rectangles.pop(self.selected_rectangle_index)
             self.selected_rectangle_index = None
             self.rect_drag_mode = None
@@ -2487,6 +2634,7 @@ class AnnotationCanvas(QWidget):
         return False
 
     def flatten_all_annotations(self):
+        self._push_undo_state()
         self.markers_flattened = True
         self.selected_marker_index = None
         self.dragging_marker_index = None
@@ -2500,30 +2648,11 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def undo_last_shape(self):
-        if self._image_undo_stack:
-            self.base_pixmap = self._image_undo_stack.pop()
-            self.update()
-            self.optionsUpdated.emit()
-            return True
-        if self.text_items:
-            self.text_items.pop()
-            self.selected_text_index = None
-            self.update()
-            self.optionsUpdated.emit()
-            return True
-        if self.markers and not self.markers_flattened:
-            self.markers.pop()
-            self.selected_marker_index = None
-            self.update()
-            self.optionsUpdated.emit()
-            return True
-        if self.rectangles and not self.rectangles_flattened:
-            self.rectangles.pop()
-            self.selected_rectangle_index = None
-            self.update()
-            self.optionsUpdated.emit()
-            return True
-        return False
+        if not self._undo_stack:
+            return False
+        snapshot = self._undo_stack.pop()
+        self._restore_state(snapshot)
+        return True
 
     def _reset_rect_drag(self):
         self.rect_drag_mode = None
@@ -2712,6 +2841,7 @@ class AnnotationCanvas(QWidget):
     def _handle_marker_press(self, pos: QPoint, allow_creation=True):
         idx = self._marker_hit_test(pos)
         if idx is not None and not self.markers_flattened:
+            self._push_undo_state()
             self.dragging_marker_index = idx
             self.selected_marker_index = idx
             self.selected_rectangle_index = None
@@ -2723,6 +2853,7 @@ class AnnotationCanvas(QWidget):
             self.update()
             return True
         if allow_creation:
+            self._push_undo_state()
             marker = {
                 'pos': pos,
                 'number': self.next_marker_number,
@@ -2750,6 +2881,7 @@ class AnnotationCanvas(QWidget):
     def _handle_text_press(self, pos: QPoint, allow_creation=False):
         idx = self._text_hit_test(pos)
         if idx is not None:
+            self._push_undo_state()
             self.selected_text_index = idx
             self.selected_marker_index = None
             self.selected_rectangle_index = None
@@ -2772,6 +2904,7 @@ class AnnotationCanvas(QWidget):
         text = text.replace("\r", "").replace("\n", "").strip()
         if not text:
             return False
+        self._push_undo_state()
         item = {
             "pos": QPoint(pos),
             "text": text,
@@ -2808,6 +2941,7 @@ class AnnotationCanvas(QWidget):
         text = text.strip()
         if not text:
             return
+        self._push_undo_state()
         item["text"] = text
         self.optionsUpdated.emit()
         self.update()
@@ -2843,6 +2977,7 @@ class AnnotationCanvas(QWidget):
     def _handle_rect_press(self, pos: QPoint, allow_creation=True, handles_only=False):
         idx, handle = self._rect_handle_hit_test(pos)
         if idx is not None:
+            self._push_undo_state()
             self.selected_rectangle_index = idx
             self.selected_marker_index = None
             self.dragging_marker_index = None
@@ -2863,6 +2998,7 @@ class AnnotationCanvas(QWidget):
             return False
         idx = self._rect_hit_test(pos)
         if idx is not None:
+            self._push_undo_state()
             self.selected_rectangle_index = idx
             self.selected_marker_index = None
             self.selected_text_index = None
@@ -2878,6 +3014,7 @@ class AnnotationCanvas(QWidget):
             return True
         if not allow_creation:
             return False
+        self._push_undo_state()
         rect_info = {
             'rect': QRect(pos, pos),
             'fill': QColor(self.rectangle_fill_color),
