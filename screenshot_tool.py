@@ -1914,7 +1914,7 @@ class AnnotationCanvas(QWidget):
         self._selection_handle = None
         self._selection_initial_rect = None
         self._selection_offset = QPoint()
-        self.selection_fill_color = QColor("#80000000")
+        self.selection_fill_color = QColor("#FFFFFFFF")
         self._apply_zoom()
 
     def zoom_factor(self):
@@ -4157,24 +4157,44 @@ class SelectionOptionsPanel(QFrame):
     def __init__(self, canvas: AnnotationCanvas):
         super().__init__()
         self.canvas = canvas
+        self.setObjectName("SelectionPanel")
+        self._accent = QColor("#0ea5e9")
+        self.setStyleSheet(
+            """
+            QFrame#SelectionPanel {
+                background: rgba(14,165,233,0.08);
+                border-radius: 10px;
+            }
+            QFrame#SelectionPanel QPushButton {
+                background: #0ea5e9;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-weight: 600;
+            }
+            """
+        )
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
 
         title = QLabel("选区操作")
         title.setStyleSheet("font-weight: 700; color: #0f172a;")
         layout.addWidget(title)
 
-        self.color_btn = QPushButton("填充颜色")
+        self.color_btn = QPushButton("填充色")
         self.color_btn.clicked.connect(self._choose_color)
         self._update_color_button()
         layout.addWidget(self.color_btn)
 
         fill_btn = QPushButton("填充选区")
+        fill_btn.setStyleSheet("background: #0ea5e9; color: #ffffff; border: none; border-radius: 6px; padding: 6px 10px; font-weight: 600;")
         fill_btn.clicked.connect(lambda: self.canvas.fill_selection_pixels(self.canvas.selection_fill_color))
         layout.addWidget(fill_btn)
 
-        clear_btn = QPushButton("清空选区")
+        clear_btn = QPushButton("清除选区")
+        clear_btn.setStyleSheet("background: #0284c7; color: #ffffff; border: none; border-radius: 6px; padding: 6px 10px; font-weight: 600;")
         clear_btn.clicked.connect(self.canvas.clear_selection_pixels)
         layout.addWidget(clear_btn)
 
@@ -4185,10 +4205,10 @@ class SelectionOptionsPanel(QFrame):
     def _update_color_button(self):
         color = self.canvas.selection_fill_color
         if not color or not color.isValid():
-            color = QColor("#00000080")
+            color = QColor("#FFFFFFFF")
             self.canvas.selection_fill_color = color
         self.color_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {color.name(QColor.HexArgb)}; color: #0f172a; border: 1px solid #cbd5e1; padding: 6px 10px; }}"
+            f"QPushButton {{ background-color: {color.name(QColor.HexArgb)}; color: #0f172a; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 10px; }}"
         )
 
     def _choose_color(self):
