@@ -21,6 +21,8 @@ except ImportError:  # pragma: no cover - optional dependency
 from PyQt5.QtCore import (
     QPoint,
     QRect,
+    QPointF,
+    QRectF,
     Qt,
     pyqtSignal,
     QTimer,
@@ -37,6 +39,7 @@ from PyQt5.QtGui import (
     QColor,
     QGuiApplication,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QImage,
@@ -3425,26 +3428,135 @@ class AnnotationTab(QWidget):
         self.dirty = False
         layout = QVBoxLayout()
 
+        def _make_tool_icon(kind: str, base_color: str, stroke_color: str) -> QIcon:
+            # 64px 矢量底稿，配合 32px 展示，细节更平滑
+            size = QSize(64, 64)
+            scale = size.width() / 48.0
+            sc = lambda v: float(v) * scale
+            rectf = lambda x, y, w, h: QRectF(sc(x), sc(y), sc(w), sc(h))
+            pix = QPixmap(size)
+            pix.fill(Qt.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+            bg_rect = rectf(5, 6, 48 - 10, 48 - 16)
+            bg_path = QPainterPath()
+            bg_path.addRoundedRect(bg_rect, sc(12), sc(12))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(base_color))
+            painter.drawPath(bg_path)
+
+            stroke = QPen(QColor(stroke_color), sc(2.6), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            painter.setPen(stroke)
+            painter.setBrush(QColor(stroke_color))
+            if kind == "rect":
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rectf(12, 14, 24, 18), sc(8), sc(8))
+            elif kind == "marker":
+                outer = rectf(14, 12, 20, 20)
+                painter.setPen(stroke)
+                painter.setBrush(QColor(stroke_color))
+                painter.drawEllipse(outer)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#ffffff"))
+                inner_rect = rectf(18, 16, 12, 12)
+                painter.drawEllipse(inner_rect)
+                num_font = QFont()
+                num_font.setBold(True)
+                num_font.setPointSize(int(sc(10)))
+                painter.setFont(num_font)
+                painter.setPen(QColor(stroke_color))
+                painter.drawText(inner_rect, Qt.AlignCenter, "1")
+            elif kind == "text":
+                font = QFont()
+                font.setBold(True)
+                font.setPointSize(int(sc(14)))
+                painter.setFont(font)
+                painter.drawText(pix.rect().adjusted(0, int(sc(6)), 0, -int(sc(12))), Qt.AlignCenter, "T")
+            elif kind == "select":
+                painter.setBrush(Qt.NoBrush)
+                frame = rectf(11, 14, 26, 18)
+                painter.setPen(QPen(QColor(stroke_color), sc(2.5), Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
+                painter.drawRoundedRect(frame, sc(6), sc(6))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(stroke_color))
+                h = sc(6)
+                handles = [
+                    QRectF(frame.left() - h / 2, frame.top() - h / 2, h, h),  # top-left
+                    QRectF(frame.right() - h / 2, frame.top() - h / 2, h, h),  # top-right
+                    QRectF(frame.left() - h / 2, frame.bottom() - h / 2, h, h),  # bottom-left
+                    QRectF(frame.right() - h / 2, frame.bottom() - h / 2, h, h),  # bottom-right
+                ]
+                for r in handles:
+                    painter.drawRect(r)
+            elif kind == "clear":
+                painter.save()
+                painter.translate(sc(6), -sc(1))
+                painter.rotate(-15)
+                body = rectf(16, 18, 20, 12)
+                top_strip = rectf(16, 18, 20, 5)
+                painter.setPen(QPen(QColor("#0b1220"), sc(0.8)))
+                painter.setBrush(QColor("#f3f4f6"))
+                painter.drawRoundedRect(body, sc(3), sc(3))
+                painter.setBrush(QColor(stroke_color))
+                painter.drawRoundedRect(top_strip, sc(2.5), sc(2.5))
+                painter.restore()
+                painter.setPen(QPen(QColor(stroke_color), sc(2.2), Qt.SolidLine, Qt.RoundCap))
+                painter.drawLine(QPointF(sc(22), sc(34)), QPointF(sc(36), sc(26)))
+            elif kind == "delete":
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rectf(14, 18, 20, 16), sc(3), sc(3))
+                painter.drawLine(QPointF(sc(14), sc(18)), QPointF(sc(34), sc(18)))
+                painter.drawLine(QPointF(sc(18), sc(14)), QPointF(sc(30), sc(14)))
+                painter.drawLine(QPointF(sc(20), sc(14)), QPointF(sc(20), sc(11)))
+                painter.drawLine(QPointF(sc(28), sc(14)), QPointF(sc(28), sc(11)))
+                painter.drawLine(QPointF(sc(20), sc(22)), QPointF(sc(20), sc(30)))
+                painter.drawLine(QPointF(sc(24), sc(22)), QPointF(sc(24), sc(30)))
+                painter.drawLine(QPointF(sc(28), sc(22)), QPointF(sc(28), sc(30)))
+            elif kind == "duplicate":
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rectf(12, 14, 18, 16), sc(5), sc(5))
+                painter.drawRoundedRect(rectf(18, 18, 18, 16), sc(5), sc(5))
+            elif kind == "flatten":
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rectf(12, 14, 24, 6), sc(3), sc(3))
+                painter.drawRoundedRect(rectf(12, 22, 24, 6), sc(3), sc(3))
+                painter.drawRoundedRect(rectf(12, 30, 24, 6), sc(3), sc(3))
+            elif kind == "save":
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rectf(14, 28, 20, 8), sc(3), sc(3))
+                painter.drawLine(QPointF(sc(24), sc(14)), QPointF(sc(24), sc(28)))
+                painter.drawLine(QPointF(sc(24), sc(26)), QPointF(sc(17), sc(20)))
+                painter.drawLine(QPointF(sc(24), sc(26)), QPointF(sc(31), sc(20)))
+            painter.end()
+            return QIcon(pix)
+
         toolbar = QToolBar("工具栏")
         toolbar.setObjectName("AnnotationToolbar")
         toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(0, 0))
+        toolbar.setIconSize(QSize(30, 30))
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         toolbar.setStyleSheet(
             """
             QToolBar#AnnotationToolbar {
                 border: none;
-                padding: 0;
-                margin-bottom: 2px;
+                padding: 1px 0;
+                margin-bottom: 1px;
             }
             QToolBar#AnnotationToolbar QToolButton {
-                border-radius: 6px;
-                padding: 2px 10px;
-                font-weight: 600;
-                background: rgba(14,19,37,0.08);
-                color: #1b2130;
-                margin-right: 2px;
-                min-height: 24px;
+                border-radius: 7px;
+                padding: 3px 8px 4px;
+                font-weight: 700;
+                font-size: 11px;
+                background: rgba(14,19,37,0.05);
+                color: #0f172a;
+                margin-right: 3px;
+                min-height: 32px;
+                min-width: 54px;
+                qproperty-iconSize: 30px;
             }
+            QToolBar#AnnotationToolbar QToolButton::menu-indicator { width: 0; height: 0; }
             QToolBar#AnnotationToolbar QToolButton#Tool_rect {
                 background: rgba(95,39,205,0.18);
                 color: #421aab;
@@ -3480,7 +3592,10 @@ class AnnotationTab(QWidget):
             """
         )
 
+
+
         rect_action = QAction("标注框", self)
+        rect_action.setIcon(_make_tool_icon("rect", "#e9ddff", "#5f27cd"))
         rect_action.setCheckable(True)
         rect_action.triggered.connect(lambda: self._set_tool(Tool.RECTANGLE))
         toolbar.addAction(rect_action)
@@ -3489,6 +3604,7 @@ class AnnotationTab(QWidget):
             rect_button.setObjectName("Tool_rect")
 
         marker_action = QAction("顺序标记", self)
+        marker_action.setIcon(_make_tool_icon("marker", "#d1fae5", "#0f6d57"))
         marker_action.setCheckable(True)
         marker_action.triggered.connect(lambda: self._set_tool(Tool.MARKER))
         toolbar.addAction(marker_action)
@@ -3497,6 +3613,7 @@ class AnnotationTab(QWidget):
             marker_button.setObjectName("Tool_marker")
 
         text_action = QAction("插入文字", self)
+        text_action.setIcon(_make_tool_icon("text", "#fef3c7", "#b45309"))
         text_action.setCheckable(True)
         text_action.triggered.connect(lambda: self._set_tool(Tool.TEXT))
         toolbar.addAction(text_action)
@@ -3505,6 +3622,7 @@ class AnnotationTab(QWidget):
             text_button.setObjectName("Tool_text")
 
         select_action = QAction("选区", self)
+        select_action.setIcon(_make_tool_icon("select", "#dbeafe", "#0ea5e9"))
         select_action.setCheckable(True)
         select_action.triggered.connect(lambda: self._set_tool(Tool.SELECTION))
         toolbar.addAction(select_action)
@@ -3513,22 +3631,27 @@ class AnnotationTab(QWidget):
             select_button.setObjectName("Tool_select")
 
         clear_action = QAction("清除标注", self)
+        clear_action.setIcon(_make_tool_icon("clear", "#e5e7eb", "#111827"))
         clear_action.triggered.connect(self.canvas.clear_annotations)
         toolbar.addAction(clear_action)
 
         delete_action = QAction("删除选中", self)
+        delete_action.setIcon(_make_tool_icon("delete", "#f3f4f6", "#b91c1c"))
         delete_action.triggered.connect(self._delete_selected)
         toolbar.addAction(delete_action)
 
         duplicate_action = QAction("复制当前", self)
+        duplicate_action.setIcon(_make_tool_icon("duplicate", "#e0f2fe", "#0f172a"))
         duplicate_action.triggered.connect(self._duplicate_active_shape)
         toolbar.addAction(duplicate_action)
 
         flatten_action = QAction("平化", self)
+        flatten_action.setIcon(_make_tool_icon("flatten", "#e5e7eb", "#1f2937"))
         flatten_action.triggered.connect(self.canvas.flatten_markers)
         toolbar.addAction(flatten_action)
 
         save_action = QAction("保存标注图", self)
+        save_action.setIcon(_make_tool_icon("save", "#ede9fe", "#4338ca"))
         save_action.triggered.connect(self.save_annotated_image)
         toolbar.addAction(save_action)
 
