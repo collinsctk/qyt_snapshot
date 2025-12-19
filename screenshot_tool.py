@@ -13,10 +13,21 @@ import logging
 import atexit
 import signal
 import winreg
+import threading  # 新增：用于异步 IO
 from urllib.parse import urlparse
 from datetime import datetime
 from enum import Enum, auto
 from contextlib import contextmanager
+
+# Windows API 导入
+try:
+    import win32api
+    import win32process
+    import win32con
+except ImportError:
+    win32api = None
+    win32process = None
+    win32con = None
 
 # region agent log helpers
 # Debug Mode: 运行时证据日志（NDJSON），写入 Cursor 提供的固定路径
@@ -193,6 +204,11 @@ DEFAULT_TEXT_STYLE = {
     "font": "Microsoft YaHei",
     "size": 18,
     "background": "transparent",
+}
+
+DEFAULT_IMAGE_BORDER_STYLE = {
+    "color": "#FF7043",
+    "width": 0,
 }
 
 _FONT_SUPPORT_CACHE = {}
@@ -485,17 +501,17 @@ def _show_message_box(title, text, parent=None, critical=False):
 
 
 def save_config(data, parent=None):
-    try:
-        os.makedirs(USER_DATA_DIR, exist_ok=True)
-        with open(USER_CONFIG_FILE, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=False)
-    except OSError as exc:
-        _show_message_box(
-            "保存配置失败",
-            f"无法写入用户配置文件，请检查写入权限或选择可写目录。\n\n系统信息: {exc}",
-            parent=parent,
-            critical=True,
-        )
+    """异步保存配置文件，避免阻塞主线程"""
+    def _do_save():
+        try:
+            os.makedirs(USER_DATA_DIR, exist_ok=True)
+            with open(USER_CONFIG_FILE, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False)
+        except OSError as exc:
+            logging.error(f"Failed to save config: {exc}")
+            # 异步保存时如果出错，不弹出阻塞对话框，仅记录日志
+
+    threading.Thread(target=_do_save, daemon=True).start()
 
 
 def _normalized_ai_settings(settings):
@@ -904,6 +920,7 @@ class Tool(Enum):
     MARKER = auto()
     TEXT = auto()
     SELECTION = auto()
+    IMAGE = auto()
 
 MODIFIER_ORDER = [
     (Qt.ControlModifier, "Ctrl"),
@@ -2066,6 +2083,11 @@ class AnnotationCanvas(QWidget):
         self.rectangle_border_width = DEFAULT_RECT_STYLE["width"]
         self.rectangle_corner_radius = DEFAULT_RECT_STYLE["radius"]
         self.rectangles_flattened = True
+        
+        # 图片边框设置
+        self.image_border_color = QColor(DEFAULT_IMAGE_BORDER_STYLE["color"])
+        self.image_border_width = DEFAULT_IMAGE_BORDER_STYLE["width"]
+        
         self.selected_rectangle_index = None
         self.rect_drag_mode = None
         self.rect_drag_handle = None
@@ -2094,7 +2116,17 @@ class AnnotationCanvas(QWidget):
         self._selection_initial_rect = None
         self._selection_offset = QPoint()
         self.selection_fill_color = QColor("#FFFFFFFF")
+        
+        # 渲染优化：引入离屏缓存层
+        self._backing_store = QPixmap()
+        self._backing_store_dirty = True
+        
         self._apply_zoom()
+
+    def update(self):
+        """重写 update 方法，确保每次更新都会重新渲染缓存层"""
+        self._backing_store_dirty = True
+        super().update()
 
     def zoom_factor(self):
         return self._zoom
@@ -2169,7 +2201,7 @@ class AnnotationCanvas(QWidget):
         self.selected_text_index = None
         self._reset_rect_drag()
         self._marker_dragging = False
-        self.update()
+        self._mark_backing_store_dirty()
         self.optionsUpdated.emit()
 
     def _has_active_marker(self):
@@ -2350,7 +2382,7 @@ class AnnotationCanvas(QWidget):
             return self.duplicate_marker()
         return False
 
-    def apply_style_defaults(self, marker_style, rect_style, text_style=None):
+    def apply_style_defaults(self, marker_style, rect_style, text_style=None, image_border_style=None):
         if marker_style:
             self.marker_fill_color = QColor(marker_style.get("fill", DEFAULT_MARKER_STYLE["fill"]))
             self.marker_border_color = QColor(marker_style.get("border", DEFAULT_MARKER_STYLE["border"]))
@@ -2366,6 +2398,11 @@ class AnnotationCanvas(QWidget):
             self.rectangle_corner_radius = rect_style.get("radius", DEFAULT_RECT_STYLE["radius"])
         if text_style:
             self.apply_text_style_defaults(text_style)
+        if image_border_style:
+            self.image_border_color = QColor(image_border_style.get("color", DEFAULT_IMAGE_BORDER_STYLE["color"]))
+            self.image_border_width = image_border_style.get("width", DEFAULT_IMAGE_BORDER_STYLE["width"])
+        self.optionsUpdated.emit()
+        self.update()
 
     def apply_text_style_defaults(self, text_style):
         style = text_style or {}
@@ -3247,15 +3284,83 @@ class AnnotationCanvas(QWidget):
         self._update_cursor(Qt.ArrowCursor)
         return True
 
+    def _mark_backing_store_dirty(self):
+        self._backing_store_dirty = True
+        self.update()
+
+    def _render_to_backing_store(self):
+        if self.base_pixmap.isNull():
+            return
+        if self._backing_store.size() != self.base_pixmap.size():
+            self._backing_store = QPixmap(self.base_pixmap.size())
+        self._backing_store.fill(Qt.transparent)
+        painter = QPainter(self._backing_store)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        
+        # 绘制底图
+        painter.drawPixmap(0, 0, self.base_pixmap)
+        
+        # 绘制所有矩形
+        for info in self.rectangles:
+            painter.setBrush(info['fill'])
+            if info['border_enabled']:
+                painter.setPen(QPen(info['border'], info['width']))
+            else:
+                painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(info['rect'], info['radius'], info['radius'])
+            
+        # 绘制所有文字
+        for idx, item in enumerate(self.text_items):
+            bounding, text_font, _ = self._text_geometry(item)
+            painter.setFont(text_font)
+            bg_color = item.get("background") or self.text_background_color
+            bg_qcolor = QColor(bg_color)
+            if bg_qcolor.isValid() and bg_qcolor.alpha() > 0:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(bg_qcolor)
+                painter.drawRect(bounding)
+            painter.setPen(QColor(item.get("color") or self.text_color))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawText(item["pos"], item["text"])
+            
+        # 绘制所有标记
+        marker_font = QFont()
+        marker_font.setBold(True)
+        for marker in self.markers:
+            radius = marker['size']
+            marker_font.setPixelSize(int(radius * marker['font_ratio']))
+            painter.setFont(marker_font)
+            ellipse_rect = QRect(marker['pos'].x() - radius, marker['pos'].y() - radius, radius * 2, radius * 2)
+            painter.setBrush(marker['fill'])
+            painter.drawEllipse(ellipse_rect)
+            if marker['border_enabled']:
+                painter.setPen(QPen(marker['border_color'], max(2, radius * 0.2)))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(ellipse_rect)
+            painter.setBrush(marker['fill'])
+            painter.setPen(Qt.white)
+            painter.drawText(ellipse_rect, Qt.AlignCenter, str(marker['number']))
+            
+        painter.end()
+        self._backing_store_dirty = False
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.scale(self._zoom, self._zoom)
-        # Checkerboard background to显式展示透明区域
+        
+        # 1. 绘制棋盘格背景
         brush = self._checkerboard_brush()
         painter.fillRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height(), brush)
-        painter.drawPixmap(0, 0, self.base_pixmap)
+        
+        # 2. 核心渲染优化：绘制缓存层
+        if self._backing_store_dirty:
+            self._render_to_backing_store()
+        painter.drawPixmap(0, 0, self._backing_store)
+        
+        # 3. 动态层：绘制选区和高亮
         if self.selection_rect and self.selection_rect.width() > 1 and self.selection_rect.height() > 1:
             overlay = QColor("#0ea5e980")
             painter.setBrush(overlay)
@@ -3265,74 +3370,61 @@ class AnnotationCanvas(QWidget):
                 painter.setBrush(QColor("#0ea5e9"))
                 painter.setPen(Qt.NoPen)
                 painter.drawRect(handle_rect)
-        for idx, info in enumerate(self.rectangles):
-            painter.setBrush(info['fill'])
-            if info['border_enabled']:
-                painter.setPen(QPen(info['border'], info['width']))
-            else:
-                painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(info['rect'], info['radius'], info['radius'])
-        for idx, item in enumerate(self.text_items):
-            text_color = item.get("color") or self.text_color
-            bounding, text_font, _ = self._text_geometry(item)
-            painter.setFont(text_font)
-            bg_color = item.get("background") or self.text_background_color
-            bg_qcolor = QColor(bg_color)
-            if bg_qcolor.isValid() and bg_qcolor.alpha() > 0:
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(bg_qcolor)
-                painter.drawRect(bounding)
-            painter.setPen(QColor(text_color))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawText(item["pos"], item["text"])
-            if idx == self.selected_text_index:
-                highlight_rect = bounding.adjusted(-4, -3, 4, 3)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(247, 181, 0, 70))
-                painter.drawRect(highlight_rect)
-                painter.setPen(QPen(QColor("#f7b500")))
-                painter.setBrush(Qt.NoBrush)
-                painter.drawRect(highlight_rect)
-        painter.setPen(Qt.NoPen)
-        font = QFont()
-        font.setBold(True)
-        for idx, marker in enumerate(self.markers):
-            radius = marker['size']
-            font.setPixelSize(int(radius * marker['font_ratio']))
-            painter.setFont(font)
-            ellipse_rect = QRect(marker['pos'].x() - radius, marker['pos'].y() - radius, radius * 2, radius * 2)
-            painter.setBrush(marker['fill'])
-            painter.drawEllipse(ellipse_rect)
-            if marker['border_enabled']:
-                painter.setPen(QPen(marker['border_color'], max(2, radius * 0.2)))
-                painter.setBrush(Qt.NoBrush)
-                painter.drawEllipse(ellipse_rect)
-                painter.setPen(Qt.NoPen)
-            painter.setBrush(marker['fill'])
-            painter.setPen(Qt.white)
-            painter.drawText(ellipse_rect, Qt.AlignCenter, str(marker['number']))
+        
+        # 绘制文本选中高亮
+        if self.selected_text_index is not None and self.selected_text_index < len(self.text_items):
+            item = self.text_items[self.selected_text_index]
+            bounding, _, _ = self._text_geometry(item)
+            highlight_rect = bounding.adjusted(-4, -3, 4, 3)
             painter.setPen(Qt.NoPen)
-            should_draw = (
-                not self.markers_flattened
-                and self.dragging_marker_index is None
-                and idx == self.selected_marker_index
-            )
-            if should_draw:
-                glow_rect = ellipse_rect.adjusted(-int(radius * 0.2), -int(radius * 0.2), int(radius * 0.2), int(radius * 0.2))
-                color = QColor(marker['fill'])
-                color.setAlpha(120)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(color)
-                painter.drawEllipse(glow_rect)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(marker['fill'])
+            painter.setBrush(QColor(247, 181, 0, 70))
+            painter.drawRect(highlight_rect)
+            painter.setPen(QPen(QColor("#f7b500")))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(highlight_rect)
+
+        # 绘制标记选中高亮
+        if self.selected_marker_index is not None and self.selected_marker_index < len(self.markers):
+            marker = self.markers[self.selected_marker_index]
+            radius = marker['size']
+            ellipse_rect = QRect(marker['pos'].x() - radius, marker['pos'].y() - radius, radius * 2, radius * 2)
+            glow_rect = ellipse_rect.adjusted(-int(radius * 0.2), -int(radius * 0.2), int(radius * 0.2), int(radius * 0.2))
+            color = QColor(marker['fill'])
+            color.setAlpha(120)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(glow_rect)
 
     def export_pixmap(self):
-        annotated = QPixmap(self.base_pixmap.size())
+        """导出最终图像，包含所有标注和可选的边框"""
+        # 如果设置了边框，导出的图需要略大一点以容纳边框
+        w = self.base_pixmap.width()
+        h = self.base_pixmap.height()
+        bw = self.image_border_width
+        
+        # 创建一个包含边框的新画布
+        final_w = w + bw * 2
+        final_h = h + bw * 2
+        annotated = QPixmap(final_w, final_h)
         annotated.fill(Qt.transparent)
+        
         painter = QPainter(annotated)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.drawPixmap(0, 0, self.base_pixmap)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        
+        # 1. 绘制边框颜色（填充整个大背景）
+        if bw > 0:
+            painter.setBrush(self.image_border_color)
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(0, 0, final_w, final_h)
+            
+        # 2. 绘制原始底图
+        painter.drawPixmap(bw, bw, self.base_pixmap)
+        
+        # 3. 绘制所有标注（注意坐标平移，因为整体多了 bw 的位移）
+        painter.translate(bw, bw)
+        
+        # 绘制矩形
         for info in self.rectangles:
             painter.setBrush(info['fill'])
             if info['border_enabled']:
@@ -3340,6 +3432,8 @@ class AnnotationCanvas(QWidget):
             else:
                 painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(info['rect'], info['radius'], info['radius'])
+            
+        # 绘制文字
         for idx, item in enumerate(self.text_items):
             text_color = item.get("color") or self.text_color
             text_font = QFont(item.get("font_family", self.text_font_family), item.get("font_size", self.text_font_size))
@@ -3355,22 +3449,16 @@ class AnnotationCanvas(QWidget):
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(bg_qcolor)
                 painter.drawRect(bounding.adjusted(-2, -2, 2, 2))
-            if idx == self.selected_text_index:
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(247, 181, 0, 70))
-                painter.drawRect(bounding.adjusted(-4, -3, 4, 3))
-                painter.setBrush(Qt.NoBrush)
-                painter.setPen(QPen(QColor("#f7b500")))
-                painter.drawRect(bounding.adjusted(-4, -3, 4, 3))
             painter.setPen(QColor(text_color))
             painter.drawText(item["pos"], item["text"])
-        painter.setPen(Qt.NoPen)
-        font = QFont()
-        font.setBold(True)
+            
+        # 绘制标记
+        marker_font = QFont()
+        marker_font.setBold(True)
         for marker in self.markers:
             radius = marker['size']
-            font.setPixelSize(int(radius * marker['font_ratio']))
-            painter.setFont(font)
+            marker_font.setPixelSize(int(radius * marker['font_ratio']))
+            painter.setFont(marker_font)
             ellipse_rect = QRect(marker['pos'].x() - radius, marker['pos'].y() - radius, radius * 2, radius * 2)
             painter.setBrush(marker['fill'])
             painter.drawEllipse(ellipse_rect)
@@ -3378,11 +3466,10 @@ class AnnotationCanvas(QWidget):
                 painter.setPen(QPen(marker['border_color'], max(2, radius * 0.2)))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawEllipse(ellipse_rect)
-                painter.setPen(Qt.NoPen)
             painter.setBrush(marker['fill'])
             painter.setPen(Qt.white)
             painter.drawText(ellipse_rect, Qt.AlignCenter, str(marker['number']))
-            painter.setPen(Qt.NoPen)
+            
         painter.end()
         return annotated
 
@@ -3615,6 +3702,7 @@ class AnnotationTab(QWidget):
             style_state.get("marker"),
             style_state.get("rectangle"),
             style_state.get("text"),
+            style_state.get("image_border"),
         )
         self.save_dir = save_dir
         if source_path:
@@ -4146,6 +4234,8 @@ class AnnotationTab(QWidget):
     def _handle_canvas_update(self):
         self._mark_dirty()
         self._update_panel_visibility()
+        # 每次画布更新时自动持久化样式设置
+        self._persist_style_defaults()
     
     def _handle_escape(self):
         # region agent log
@@ -5063,7 +5153,38 @@ class AnnotationWorkspacePage(QWidget):
         layout = QVBoxLayout()
 
         action_bar = QHBoxLayout()
-        action_bar.setContentsMargins(0, 0, 0, 0)
+        action_bar.setContentsMargins(10, 5, 10, 5)
+        action_bar.setSpacing(10)
+        
+        # 边框设置 (全局)
+        def add_bar_label(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color:#1e2433; font-size:12px; font-weight:bold;")
+            action_bar.addWidget(lbl)
+            return lbl
+
+        add_bar_label("截图边框:")
+        
+        self.border_width_spin = QSpinBox()
+        self.border_width_spin.setRange(0, 20)
+        self.border_width_spin.setSuffix(" px")
+        self.border_width_spin.setFixedWidth(70)
+        # 初始化值
+        initial_border = self._style_state.get("image_border", DEFAULT_IMAGE_BORDER_STYLE)
+        self.border_width_spin.setValue(initial_border.get("width", 0))
+        self.border_width_spin.valueChanged.connect(self._on_global_border_width_changed)
+        action_bar.addWidget(self.border_width_spin)
+        
+        self.border_color_btn = QPushButton()
+        self.border_color_btn.setFixedSize(24, 24)
+        self.border_color_btn.setCursor(Qt.PointingHandCursor)
+        self.border_color_btn.setToolTip("选择边框颜色")
+        initial_color = initial_border.get("color", "#FF7043")
+        self.border_color_btn.setStyleSheet(f"background-color: {initial_color}; border: 1px solid #ccc; border-radius: 4px;")
+        self.border_color_btn.clicked.connect(self._on_global_border_color_clicked)
+        action_bar.addWidget(self.border_color_btn)
+
+        action_bar.addStretch(1)
         self.copy_all_btn = QPushButton("多图复制到剪贴板")
         self.copy_all_btn.setToolTip("将当前打开的所有截图渲染为临时文件并写入剪贴板（微信/QQ 可一次粘贴多图）。")
         self.copy_all_btn.setEnabled(False)
@@ -5074,7 +5195,6 @@ class AnnotationWorkspacePage(QWidget):
         self.clear_all_btn.setEnabled(False)
         self.clear_all_btn.clicked.connect(self.clear_all_tabs)
 
-        action_bar.addStretch(1)
         action_bar.addWidget(self.copy_all_btn, 0, Qt.AlignRight)
         action_bar.addWidget(self.clear_all_btn, 0, Qt.AlignRight)
         layout.addLayout(action_bar)
@@ -5109,6 +5229,33 @@ class AnnotationWorkspacePage(QWidget):
             },
         )
         # endregion
+
+    def _on_global_border_width_changed(self, value):
+        data = {"width": value}
+        self._style_state.setdefault("image_border", {}).update(data)
+        self._style_callback("image_border", data)
+        # 同步到所有已打开的 tab（边框只影响导出，不影响编辑视图）
+        for tab in self._iter_tabs():
+            if hasattr(tab, "canvas"):
+                tab.canvas.image_border_width = value
+
+    def _on_global_border_color_clicked(self):
+        current_color = QColor(self._style_state.get("image_border", {}).get("color", "#FF7043"))
+        color = QColorDialog.getColor(current_color, self, "选择截图边框颜色")
+        if color.isValid():
+            hex_color = color.name()
+            self.border_color_btn.setStyleSheet(f"background-color: {hex_color}; border: 1px solid #ccc; border-radius: 4px;")
+            data = {"color": hex_color}
+            self._style_state.setdefault("image_border", {}).update(data)
+            self._style_callback("image_border", data)
+            # 同步到所有已打开的 tab（边框只影响导出，不影响编辑视图）
+            for tab in self._iter_tabs():
+                if hasattr(tab, "canvas"):
+                    tab.canvas.image_border_color = color
+
+    def _iter_tabs(self):
+        for i in range(self.tabs.count()):
+            yield self.tabs.widget(i)
 
     def _update_hint_visibility(self):
         has_tabs = self.tabs.count() > 0
@@ -5510,7 +5657,8 @@ class AnnotationWorkspacePage(QWidget):
             self.tabs.setCurrentWidget(tab)
             self._remember_active_tab(self.tabs.currentIndex())
         self._install_tab_scroll_button_filters()
-        self._apply_shared_tool_to_tab(tab)
+        # 新标签页默认选择标注框工具
+        tab._set_tool(Tool.RECTANGLE)
         QTimer.singleShot(0, self._restore_tab_scroll_anchor)
         self._update_hint_visibility()
 
@@ -5639,23 +5787,22 @@ class CaptureOverlay(QWidget):
         # 这样可以 100% 准确地适配 100%, 125%, 150%, 200% 等所有缩放比例
         self._scale_x = self._compute_scale(self.screenshot.width(), geo.width())
         self._scale_y = self._compute_scale(self.screenshot.height(), geo.height())
+        
+        # 彻底移除之前的 _dimmed_screenshot 预计算逻辑，实现瞬时启动
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        # 启用平滑缩放以适应高 DPI
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         
-        # 1. 绘制完整的静态底图（填充整个物理窗口）
+        # 1. 直接绘制原始静态底图
         painter.drawPixmap(self.rect(), self.screenshot)
 
-        # 2. 绘制一层半透明黑色遮罩
+        # 2. 实时绘制一层半透明黑色遮罩 (利用 GPU 硬件加速)
         overlay_color = QColor(0, 0, 0, 120)
         painter.fillRect(self.rect(), overlay_color)
 
-        # 3. 如果有选区，在高亮区重新绘制底图
+        # 3. 如果有选区，在高亮区重新绘制原始清晰图
         if self.selection and self.selection.isValid():
-            # 这里必须使用逻辑坐标到物理像素的映射
-            # 我们直接从 screenshot 中截取对应的部分并画到逻辑位置上
             device_rect = self._device_rect(self.selection)
             painter.drawPixmap(self.selection, self.screenshot, device_rect)
             
@@ -5821,6 +5968,7 @@ class ScreenSnapApp(QMainWindow):
         self.rectangle_style = self.config.get("rectangle_style", DEFAULT_RECT_STYLE.copy())
         self.text_style = self.config.get("text_style", DEFAULT_TEXT_STYLE.copy())
         self.text_style["font"] = _sanitize_font_family(self.text_style.get("font"))
+        self.image_border_style = self.config.get("image_border_style", DEFAULT_IMAGE_BORDER_STYLE.copy())
 
         self.workspace_page = AnnotationWorkspacePage(
             lambda: self._open_settings_dialog(),
@@ -5829,6 +5977,7 @@ class ScreenSnapApp(QMainWindow):
                 "marker": self.marker_style,
                 "rectangle": self.rectangle_style,
                 "text": self.text_style,
+                "image_border": self.image_border_style,
             },
             self._on_style_changed,
             self._image_quality,
@@ -5945,6 +6094,18 @@ class ScreenSnapApp(QMainWindow):
         else:
             self.show()
         self.translation_panel.set_ai_settings(self.ai_settings)
+
+    def _set_process_priority(self, high=True):
+        """设置进程优先级，确保截图过程获得最高优先级资源"""
+        if win32process is None:
+            return
+        try:
+            handle = win32api.GetCurrentProcess()
+            priority = win32con.HIGH_PRIORITY_CLASS if high else win32con.NORMAL_PRIORITY_CLASS
+            win32process.SetPriorityClass(handle, priority)
+            logging.info(f"Process priority set to {'HIGH' if high else 'NORMAL'}")
+        except Exception as e:
+            logging.warning(f"Failed to set process priority: {e}")
 
     def _switch_page(self, key):
         # region agent log
@@ -6090,37 +6251,24 @@ class ScreenSnapApp(QMainWindow):
     def _start_capture_session(self, handler):
         self._pending_capture_handler = handler
         
-        # 检查主窗口是否可见且未最小化
+        # 核心优化 1：立即提升优先级，并使用透明度瞬间“隐藏”窗口，不再死等 150ms
+        self._set_process_priority(True)
         was_visible = self.isVisible() and not self.isMinimized()
         if was_visible:
+            self.setWindowOpacity(0.0) # 视觉上瞬间消失
             self.hide()
-            # 如果窗口原本可见，给系统 150ms 时间完成隐藏，避免截图中出现主窗口残影
-            delay = 150
-        else:
-            # 如果已经在托盘或最小化，可以认为“瞬间”触发
-            delay = 0
-
-        logging.info("Start capture session; was_visible=%s, delay=%dms, handler=%s", 
-                     was_visible, delay, handler.__name__ if hasattr(handler, "__name__") else str(handler))
+            # 仅在必要时给系统极短的处理时间 (10ms) 刷新 DWM
+            QApplication.processEvents()
         
-        # region agent log
-        _agent_debug_log(
-            hypothesisId="H7",
-            location="screenshot_tool.py:ScreenSnapApp._start_capture_session",
-            message="start capture session",
-            data={
-                "was_visible": was_visible,
-                "delay": delay,
-                "handler": handler.__name__ if hasattr(handler, "__name__") else str(handler)
-            },
-        )
-        # endregion
-
-        if delay > 0:
-            QTimer.singleShot(delay, self._start_overlay_capture)
-        else:
-            # 瞬间触发模式：直接截屏，不再等待事件处理，确保抓取最准确的瞬间
-            self._start_overlay_capture()
+        logging.info("Start capture session; was_visible=%s, handler=%s", 
+                     was_visible, handler.__name__ if hasattr(handler, "__name__") else str(handler))
+        
+        # 核心优化 2：立即进入截屏，不再使用 QTimer 延迟触发
+        self._start_overlay_capture()
+        
+        # 恢复透明度以便下次显示
+        if was_visible:
+            self.setWindowOpacity(1.0)
 
     def initiate_capture(self):
         # region agent log
@@ -6155,46 +6303,49 @@ class ScreenSnapApp(QMainWindow):
         self._start_capture_session(self._handle_ai_translation_capture)
 
     def _start_overlay_capture(self):
+        # 记录启动开始时间用于调试，正式版可以移除
+        start_time = time.time()
+        
         screens = QGuiApplication.screens()
         if not screens:
             _show_message_box("错误", "未找到可用的屏幕设备，无法截图。", parent=self, critical=True)
             self._show_main_window()
             return
         
-        logging.info("Overlay capture start; screens=%d", len(screens))
         self._clear_overlays()
         
-        # 1. 立即捕获所有屏幕的 Pixmap
-        # 这一步必须最先执行，且尽可能连续，以达到“全屏瞬间锁定”的效果
+        # 批量抓取所有屏幕像素
         screen_data = []
-        for screen in screens:
+        for s in screens:
             try:
-                pix = self._grab_screen_pixmap(screen)
-                screen_data.append((screen, pix))
+                pix = s.grabWindow(0)
+                pix.setDevicePixelRatio(1.0)
+                screen_data.append((s, pix))
             except Exception as e:
-                logging.error("Failed to grab screen %s: %s", screen.name(), e)
+                logging.error(f"Failed to grab screen {s.name()}: {e}")
 
-        if not screen_data:
-            _show_message_box("错误", "屏幕画面捕获失败。", parent=self, critical=True)
-            self._show_main_window()
-            return
-
-        # 2. 创建并显示遮罩层
+        # 快速构建并一键显出
         for screen, pixmap in screen_data:
             overlay = CaptureOverlay(pixmap, screen.geometry().topLeft(), screen)
             overlay.selectionMade.connect(self._on_overlay_selection)
             overlay.canceled.connect(self._on_capture_cancel)
             overlay.show()
             self._active_overlays.append(overlay)
+            
+        logging.info(f"Screen grab and overlay creation took {(time.time() - start_time):.3f}s")
 
     def _on_capture_cancel(self):
         self._clear_overlays()
+        # 截图流程结束（用户取消），恢复正常优先级
+        self._set_process_priority(False)
         self._pending_capture_handler = None
         self._show_main_window()
         logging.info("Capture canceled")
 
     def _on_overlay_selection(self, pixmap: QPixmap, selection_rect: QRect, screen_name: str):
         self._clear_overlays()
+        # 截图流程结束，恢复正常优先级
+        self._set_process_priority(False)
         handler = self._pending_capture_handler or self._handle_annotation_capture
         self._pending_capture_handler = None
         logging.info(
@@ -6353,6 +6504,9 @@ class ScreenSnapApp(QMainWindow):
         elif style_type == "text":
             self.text_style.update(data)
             self.config["text_style"] = self.text_style
+        elif style_type == "image_border":
+            self.image_border_style.update(data)
+            self.config["image_border_style"] = self.image_border_style
         save_config(self.config, parent=self)
 
     def _register_all_hotkeys(self):
