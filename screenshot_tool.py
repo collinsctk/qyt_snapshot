@@ -920,6 +920,7 @@ class Tool(Enum):
     MARKER = auto()
     TEXT = auto()
     SELECTION = auto()
+    CROP = auto()
     IMAGE = auto()
 
 MODIFIER_ORDER = [
@@ -2052,6 +2053,7 @@ class AnnotationCanvas(QWidget):
 
     HANDLE_SIZE = 12
     MIN_RECT_SIZE = 8
+    CANVAS_PADDING = 8  # 最小边距，确保边缘控制柄可以被点击
 
     def __init__(self, pixmap: QPixmap):
         super().__init__()
@@ -2149,23 +2151,35 @@ class AnnotationCanvas(QWidget):
         self.set_zoom(1.0)
 
     def _scaled_size(self):
-        return QSize(
-            max(1, int(round(self.base_pixmap.width() * self._zoom))),
-            max(1, int(round(self.base_pixmap.height() * self._zoom))),
-        )
+        # 基础缩放大小
+        sw = max(1, int(round(self.base_pixmap.width() * self._zoom)))
+        sh = max(1, int(round(self.base_pixmap.height() * self._zoom)))
+        # 加上两倍边距（左右各一，上下各一）
+        pad = int(self.CANVAS_PADDING * 2 * self._zoom)
+        return QSize(sw + pad, sh + pad)
 
     def _apply_zoom(self):
-        size = self._scaled_size()
-        self.setFixedSize(size)
+        # 画布总大小 = (原图 + 两倍边距) * 缩放
+        pad = self.CANVAS_PADDING
+        final_w = int(round((self.base_pixmap.width() + pad * 2) * self._zoom))
+        final_h = int(round((self.base_pixmap.height() + pad * 2) * self._zoom))
+        self.setFixedSize(final_w, final_h)
         self.update()
 
     def _view_to_scene(self, point: QPoint):
         if self._zoom == 0:
             return QPoint(point)
+        # 考虑到画布边距偏移：(鼠标位置 / 缩放) - 边距
+        pad = self.CANVAS_PADDING
         return QPoint(
-            int(round(point.x() / self._zoom)),
-            int(round(point.y() / self._zoom)),
+            int(round(point.x() / self._zoom - pad)),
+            int(round(point.y() / self._zoom - pad)),
         )
+        # 减去边距偏移后再进行缩放映射
+        pad = self.CANVAS_PADDING * self._zoom
+        rx = (point.x() - pad) / self._zoom
+        ry = (point.y() - pad) / self._zoom
+        return QPoint(int(round(rx)), int(round(ry)))
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.ControlModifier:
@@ -2184,7 +2198,24 @@ class AnnotationCanvas(QWidget):
         self._reset_rect_drag()
         if tool != Tool.MARKER:
             self._set_hover_marker(None)
+        if tool == Tool.CROP:
+            # 进入裁切模式时，默认选中整个图片，用户可以拖动控制柄调整
+            self.selection_rect = self.base_pixmap.rect()
+            # region agent log
+            _agent_debug_log(
+                hypothesisId="H3",
+                location="screenshot_tool.py:AnnotationCanvas.set_tool",
+                message="entering CROP mode (full image selected)",
+                data={
+                    "selection_rect": [self.selection_rect.x(), self.selection_rect.y(), self.selection_rect.width(), self.selection_rect.height()],
+                    "pixmap_rect": [self.base_pixmap.rect().x(), self.base_pixmap.rect().y(), self.base_pixmap.rect().width(), self.base_pixmap.rect().height()],
+                },
+            )
+            # endregion
+        else:
+            self.clear_active_selection()
         self._update_default_cursor()
+        self.update()
 
     def clear_annotations(self):
         self._push_undo_state()
@@ -2459,6 +2490,8 @@ class AnnotationCanvas(QWidget):
     def set_text_color(self, color: QColor):
         if not color or not color.isValid():
             return
+        if self.text_color == color:
+            return  # 值未变化，不推送 undo
         self._push_undo_state()
         self.text_color = QColor(color)
         if self._has_active_text():
@@ -2485,6 +2518,8 @@ class AnnotationCanvas(QWidget):
         family = _sanitize_font_family(family)
         if not family:
             return
+        if self.text_font_family == family:
+            return  # 值未变化，不推送 undo
         self._push_undo_state()
         self.text_font_family = family
         if self._has_active_text():
@@ -2495,6 +2530,8 @@ class AnnotationCanvas(QWidget):
     def set_text_background_color(self, color: QColor):
         if not color or not color.isValid():
             return
+        if self.text_background_color == color:
+            return  # 值未变化，不推送 undo
         self._push_undo_state()
         self.text_background_color = QColor(color)
         if self._has_active_text():
@@ -2675,7 +2712,20 @@ class AnnotationCanvas(QWidget):
 
     def _selection_handle_hit_test(self, pos: QPoint):
         handles = ['top-left', 'top-right', 'bottom-left', 'bottom-right']
-        for handle_name, handle_rect in zip(handles, self._selection_handle_rects(for_hit=True)):
+        handle_rects = self._selection_handle_rects(for_hit=True)
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H2",
+            location="screenshot_tool.py:AnnotationCanvas._selection_handle_hit_test",
+            message="handle hit test",
+            data={
+                "pos": [pos.x(), pos.y()],
+                "handle_rects": [[r.x(), r.y(), r.width(), r.height()] for r in handle_rects],
+                "selection_rect": [self.selection_rect.x(), self.selection_rect.y(), self.selection_rect.width(), self.selection_rect.height()] if self.selection_rect else None,
+            },
+        )
+        # endregion
+        for handle_name, handle_rect in zip(handles, handle_rects):
             if handle_rect.contains(pos):
                 return handle_name
         return None
@@ -2752,6 +2802,20 @@ class AnnotationCanvas(QWidget):
         }
 
     def _push_undo_state(self):
+        # region agent log
+        import traceback
+        caller_stack = traceback.format_stack(limit=5)
+        _agent_debug_log(
+            hypothesisId="H-UNDO-PUSH",
+            location="screenshot_tool.py:AnnotationCanvas._push_undo_state",
+            message="undo state pushed",
+            data={
+                "stack_size_before": len(self._undo_stack),
+                "pixmap_size": [self.base_pixmap.width(), self.base_pixmap.height()],
+                "caller": caller_stack[-2].strip() if len(caller_stack) >= 2 else "unknown",
+            },
+        )
+        # endregion
         snapshot = self._snapshot_state()
         if snapshot:
             self._undo_stack.append(snapshot)
@@ -2811,6 +2875,17 @@ class AnnotationCanvas(QWidget):
 
     def clear_selection_pixels(self):
         rect = self._selection_bounds()
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H-CLEAR-SEL",
+            location="screenshot_tool.py:AnnotationCanvas.clear_selection_pixels",
+            message="clear_selection_pixels called",
+            data={
+                "rect": [rect.x(), rect.y(), rect.width(), rect.height()] if rect else None,
+                "selection_rect": [self.selection_rect.x(), self.selection_rect.y(), self.selection_rect.width(), self.selection_rect.height()] if self.selection_rect else None,
+            },
+        )
+        # endregion
         if rect is None:
             return False
         self._push_undo_state()
@@ -2820,6 +2895,17 @@ class AnnotationCanvas(QWidget):
         painter.fillRect(rect, Qt.transparent)
         painter.end()
         self.base_pixmap = QPixmap.fromImage(image)
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H-CLEAR-SEL",
+            location="screenshot_tool.py:AnnotationCanvas.clear_selection_pixels",
+            message="clear_selection_pixels completed",
+            data={
+                "new_pixmap_format": self.base_pixmap.toImage().format(),
+                "has_alpha": self.base_pixmap.hasAlphaChannel(),
+            },
+        )
+        # endregion
         self.selection_rect = None
         self.update()
         self.optionsUpdated.emit()
@@ -2891,10 +2977,42 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
 
     def undo_last_shape(self):
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H-UNDO",
+            location="screenshot_tool.py:AnnotationCanvas.undo_last_shape",
+            message="undo_last_shape called",
+            data={
+                "stack_size": len(self._undo_stack),
+                "has_snapshot": bool(self._undo_stack),
+            },
+        )
+        # endregion
         if not self._undo_stack:
             return False
         snapshot = self._undo_stack.pop()
+        # region agent log
+        old_size = [self.base_pixmap.width(), self.base_pixmap.height()]
+        new_pixmap = snapshot.get("base_pixmap")
+        new_size = [new_pixmap.width(), new_pixmap.height()] if new_pixmap else None
+        _agent_debug_log(
+            hypothesisId="H-UNDO",
+            location="screenshot_tool.py:AnnotationCanvas.undo_last_shape",
+            message="restoring snapshot",
+            data={
+                "old_pixmap_size": old_size,
+                "new_pixmap_size": new_size,
+            },
+        )
+        # endregion
         self._restore_state(snapshot)
+        # 撤销后清除选区状态，避免工具状态混乱
+        self.selection_rect = None
+        self._selection_origin = None
+        self._selection_dragging = False
+        self._apply_zoom()  # 确保恢复缩放和窗口大小（针对裁切）
+        self._mark_backing_store_dirty()
+        self.optionsUpdated.emit()
         return True
 
     def _reset_rect_drag(self):
@@ -2909,15 +3027,66 @@ class AnnotationCanvas(QWidget):
         if event.button() != Qt.LeftButton:
             return
         pos = self._view_to_scene(event.pos())
-        if self.tool == Tool.SELECTION:
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H2-H3",
+            location="screenshot_tool.py:AnnotationCanvas.mousePressEvent",
+            message="mouse press - checking bounds",
+            data={
+                "raw_pos": [event.pos().x(), event.pos().y()],
+                "scene_pos": [pos.x(), pos.y()],
+                "tool": self.tool.name if self.tool else None,
+                "pixmap_size": [self.base_pixmap.width(), self.base_pixmap.height()],
+                "canvas_size": [self.width(), self.height()],
+                "is_pos_in_bounds": (0 <= pos.x() <= self.base_pixmap.width() and 0 <= pos.y() <= self.base_pixmap.height()),
+                "canvas_padding": self.CANVAS_PADDING,
+                "zoom": self._zoom,
+            },
+        )
+        # endregion
+        if self.tool == Tool.SELECTION or self.tool == Tool.CROP:
             handle = self._selection_handle_hit_test(pos) if self.selection_rect else None
+            # region agent log
+            _agent_debug_log(
+                hypothesisId="H2-H3-PRESS",
+                location="screenshot_tool.py:AnnotationCanvas.mousePressEvent",
+                message="CROP/SELECTION press handling",
+                data={
+                    "tool": self.tool.name,
+                    "handle": handle,
+                    "selection_rect_exists": self.selection_rect is not None,
+                    "scene_pos": [pos.x(), pos.y()],
+                },
+            )
+            # endregion
             if handle:
+                # 点击控制柄：调整选区大小
                 self._selection_drag_mode = "resize"
                 self._selection_handle = handle
                 self._selection_initial_rect = QRect(self.selection_rect).normalized()
                 self._selection_origin = QPoint(pos)
                 self._selection_dragging = True
+            elif self.tool == Tool.CROP:
+                # 裁切模式：点击任何非控制柄区域，开始画新选区
+                self.selection_rect = QRect(pos, pos)
+                self._selection_origin = QPoint(pos)
+                self._selection_dragging = True  # 设为 True，松开时才能触发裁切
+                self._selection_drag_mode = "new"
+                self._selection_handle = "bottom-right"
+                self._selection_initial_rect = QRect(self.selection_rect)
+                # region agent log
+                _agent_debug_log(
+                    hypothesisId="H2-H3-PRESS",
+                    location="screenshot_tool.py:AnnotationCanvas.mousePressEvent",
+                    message="CROP new selection started",
+                    data={
+                        "selection_rect": [self.selection_rect.x(), self.selection_rect.y(), self.selection_rect.width(), self.selection_rect.height()],
+                        "selection_origin": [self._selection_origin.x(), self._selection_origin.y()],
+                    },
+                )
+                # endregion
             elif self.selection_rect:
+                # 选区模式：点击选区内部可以移动
                 expanded = QRect(self.selection_rect).normalized()
                 expanded = expanded.adjusted(-SELECTION_HIT_MARGIN, -SELECTION_HIT_MARGIN, SELECTION_HIT_MARGIN, SELECTION_HIT_MARGIN)
                 if expanded.contains(pos):
@@ -2929,15 +3098,15 @@ class AnnotationCanvas(QWidget):
                 else:
                     self.selection_rect = QRect(pos, pos)
                     self._selection_origin = QPoint(pos)
-                    self._selection_dragging = False
-                    self._selection_drag_mode = "resize"
+                    self._selection_dragging = True
+                    self._selection_drag_mode = "new"
                     self._selection_handle = "bottom-right"
                     self._selection_initial_rect = QRect(self.selection_rect)
             else:
                 self.selection_rect = QRect(pos, pos)
                 self._selection_origin = QPoint(pos)
-                self._selection_dragging = False
-                self._selection_drag_mode = "resize"
+                self._selection_dragging = True
+                self._selection_drag_mode = "new"
                 self._selection_handle = "bottom-right"
                 self._selection_initial_rect = QRect(self.selection_rect)
             self.selected_marker_index = None
@@ -2960,7 +3129,23 @@ class AnnotationCanvas(QWidget):
     def mouseMoveEvent(self, event):
         self._maybe_auto_scroll(event)
         pos = self._view_to_scene(event.pos())
-        if self.tool == Tool.SELECTION and self._selection_origin is not None:
+        # region agent log
+        if self.tool == Tool.CROP:
+            _agent_debug_log(
+                hypothesisId="H2-H3",
+                location="screenshot_tool.py:AnnotationCanvas.mouseMoveEvent",
+                message="crop mode move",
+                data={
+                    "raw_pos": [event.pos().x(), event.pos().y()],
+                    "scene_pos": [pos.x(), pos.y()],
+                    "selection_origin": [self._selection_origin.x(), self._selection_origin.y()] if self._selection_origin else None,
+                    "selection_rect": [self.selection_rect.x(), self.selection_rect.y(), self.selection_rect.width(), self.selection_rect.height()] if self.selection_rect else None,
+                    "pixmap_size": [self.base_pixmap.width(), self.base_pixmap.height()],
+                    "_selection_dragging": self._selection_dragging,
+                },
+            )
+        # endregion
+        if (self.tool == Tool.SELECTION or self.tool == Tool.CROP) and self._selection_origin is not None:
             bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
             if self._selection_drag_mode == "move" and self.selection_rect:
                 top_left = pos - self._selection_offset
@@ -3025,7 +3210,12 @@ class AnnotationCanvas(QWidget):
         if event.button() != Qt.LeftButton:
             return
         pos = self._view_to_scene(event.pos())
-        if self.tool == Tool.SELECTION and self._selection_origin is not None:
+        
+        # 记录当前状态，因为裁切后会重置
+        is_crop_mode = (self.tool == Tool.CROP)
+        is_dragging = self._selection_dragging
+        
+        if (self.tool == Tool.SELECTION or self.tool == Tool.CROP) and self._selection_origin is not None:
             bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
             if self._selection_drag_mode == "move" and self.selection_rect:
                 rect = QRect(self.selection_rect).intersected(bounds)
@@ -3034,9 +3224,22 @@ class AnnotationCanvas(QWidget):
                 rect = QRect(self.selection_rect).normalized().intersected(bounds)
                 rect = self._clamp_rect_to_bounds(rect, bounds)
                 self.selection_rect = rect if rect else None
+            elif self._selection_drag_mode == "new":
+                # 新建选区模式
+                rect = QRect(self._selection_origin, pos).normalized().intersected(bounds)
+                self.selection_rect = rect if rect and rect.width() >= 2 and rect.height() >= 2 else None
             else:
                 rect = QRect(self._selection_origin, pos).normalized().intersected(bounds)
                 self.selection_rect = rect if rect and rect.width() >= 2 and rect.height() >= 2 else None
+            
+            # 如果是裁切模式，且松开鼠标，执行裁切
+            if is_crop_mode and is_dragging and self.selection_rect:
+                final_rect = QRect(self.selection_rect)
+                if final_rect.width() > 10 and final_rect.height() > 10:
+                    self.perform_crop(final_rect)
+                else:
+                    self.clear_active_selection()
+            
             if self.selection_rect is None:
                 # No valid selection retained
                 self._selection_origin = None
@@ -3349,29 +3552,107 @@ class AnnotationCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        painter.scale(self._zoom, self._zoom)
         
-        # 1. 绘制棋盘格背景
-        brush = self._checkerboard_brush()
-        painter.fillRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height(), brush)
+        pad = self.CANVAS_PADDING
+        zoom = self._zoom
         
-        # 2. 核心渲染优化：绘制缓存层
+        # region agent log
+        if self.tool == Tool.CROP:
+            _agent_debug_log(
+                hypothesisId="H5",
+                location="screenshot_tool.py:AnnotationCanvas.paintEvent",
+                message="paint event in CROP mode",
+                data={
+                    "canvas_size": [self.width(), self.height()],
+                    "pad": pad,
+                    "zoom": zoom,
+                    "pixmap_size": [self.base_pixmap.width(), self.base_pixmap.height()],
+                    "selection_rect": [self.selection_rect.x(), self.selection_rect.y(), self.selection_rect.width(), self.selection_rect.height()] if self.selection_rect else None,
+                    "translate_offset": [pad * zoom, pad * zoom],
+                },
+            )
+        # endregion
+        
+        # 1. 绘制背景（整个画布，包括边距）- 使用纯色背景
+        painter.fillRect(self.rect(), QColor("#f0f0f0"))
+        
+        # 2. 坐标变换：平移边距并应用缩放
+        painter.save()
+        painter.translate(pad * zoom, pad * zoom)
+        painter.scale(zoom, zoom)
+        
+        # 在底图区域先绘制棋盘格背景（用于显示透明区域）
+        img_rect = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
+        painter.fillRect(img_rect, self._checkerboard_brush())
+        
+        # 画底图
+        painter.drawPixmap(0, 0, self.base_pixmap)
+
+        # 绘制静态标注缓存
         if self._backing_store_dirty:
             self._render_to_backing_store()
         painter.drawPixmap(0, 0, self._backing_store)
         
-        # 3. 动态层：绘制选区和高亮
-        if self.selection_rect and self.selection_rect.width() > 1 and self.selection_rect.height() > 1:
-            overlay = QColor("#0ea5e980")
-            painter.setBrush(overlay)
-            painter.setPen(QPen(QColor("#0ea5e9"), 1, Qt.DashLine))
-            painter.drawRect(self.selection_rect)
-            for handle_rect in self._selection_handle_rects(for_hit=False):
-                painter.setBrush(QColor("#0ea5e9"))
-                painter.setPen(Qt.NoPen)
-                painter.drawRect(handle_rect)
+        # 3. 绘制动态元素
+        # 裁切模式提示（无选区时显示整体暗化和边框提示）
+        if self.tool == Tool.CROP and (not self.selection_rect or self.selection_rect.width() <= 1 or self.selection_rect.height() <= 1):
+            # 轻微暗化整个图像，提示用户处于裁切模式
+            img_rect = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
+            painter.setBrush(QColor(0, 0, 0, 60))  # 轻微暗化
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(img_rect)
+            # 绘制红色虚线边框提示
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#dc2626"), 2, Qt.DashLine))
+            painter.drawRect(img_rect.adjusted(1, 1, -1, -1))
         
-        # 绘制文本选中高亮
+        # 选区/裁切框
+        if self.selection_rect and self.selection_rect.width() > 1 and self.selection_rect.height() > 1:
+            if self.tool == Tool.CROP:
+                # 裁切模式：暗化外部区域，醒目的红色边框
+                img_rect = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
+                sel = self.selection_rect.normalized()
+                dim_color = QColor(0, 0, 0, 150)  # 更深的暗化
+                painter.setBrush(dim_color)
+                painter.setPen(Qt.NoPen)
+                # 上
+                if sel.top() > 0:
+                    painter.drawRect(QRect(0, 0, img_rect.width(), sel.top()))
+                # 下
+                if sel.bottom() < img_rect.height() - 1:
+                    painter.drawRect(QRect(0, sel.bottom() + 1, img_rect.width(), img_rect.height() - sel.bottom() - 1))
+                # 左
+                if sel.left() > 0:
+                    painter.drawRect(QRect(0, sel.top(), sel.left(), sel.height()))
+                # 右
+                if sel.right() < img_rect.width() - 1:
+                    painter.drawRect(QRect(sel.right() + 1, sel.top(), img_rect.width() - sel.right() - 1, sel.height()))
+                # 绘制裁切框边框（粗实线，醒目红色）
+                painter.setBrush(Qt.NoBrush)
+                pen = QPen(QColor("#dc2626"), 3, Qt.SolidLine)  # 更粗的红色边框
+                painter.setPen(pen)
+                painter.drawRect(sel)
+            else:
+                # 选区模式：使用半透明填充
+                overlay = QColor("#0ea5e980")
+                painter.setBrush(overlay)
+                painter.setPen(QPen(QColor("#0ea5e9"), 1, Qt.DashLine))
+                painter.drawRect(self.selection_rect)
+            # 绘制控制柄（裁切模式用更大更醒目的控制柄）
+            handle_rects = self._selection_handle_rects(for_hit=False)
+            for handle_rect in handle_rects:
+                if self.tool == Tool.CROP:
+                    # 裁切模式：更大更醒目的红色控制柄
+                    larger_rect = handle_rect.adjusted(-2, -2, 2, 2)
+                    painter.setBrush(QColor("#dc2626"))
+                    painter.setPen(QPen(QColor("#ffffff"), 1))
+                    painter.drawRect(larger_rect)
+                else:
+                    painter.setBrush(QColor("#0ea5e9"))
+                    painter.setPen(Qt.NoPen)
+                    painter.drawRect(handle_rect)
+        
+        # 文本选中高亮
         if self.selected_text_index is not None and self.selected_text_index < len(self.text_items):
             item = self.text_items[self.selected_text_index]
             bounding, _, _ = self._text_geometry(item)
@@ -3383,7 +3664,7 @@ class AnnotationCanvas(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(highlight_rect)
 
-        # 绘制标记选中高亮
+        # 标记选中高亮
         if self.selected_marker_index is not None and self.selected_marker_index < len(self.markers):
             marker = self.markers[self.selected_marker_index]
             radius = marker['size']
@@ -3395,12 +3676,28 @@ class AnnotationCanvas(QWidget):
             painter.setBrush(color)
             painter.drawEllipse(glow_rect)
 
+        painter.restore()
+
     def export_pixmap(self):
         """导出最终图像，包含所有标注和可选的边框"""
         # 如果设置了边框，导出的图需要略大一点以容纳边框
         w = self.base_pixmap.width()
         h = self.base_pixmap.height()
         bw = self.image_border_width
+        
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H-EXPORT",
+            location="screenshot_tool.py:AnnotationCanvas.export_pixmap",
+            message="export_pixmap called",
+            data={
+                "base_pixmap_size": [w, h],
+                "border_width": bw,
+                "base_has_alpha": self.base_pixmap.hasAlphaChannel(),
+                "base_format": self.base_pixmap.toImage().format(),
+            },
+        )
+        # endregion
         
         # 创建一个包含边框的新画布
         final_w = w + bw * 2
@@ -3412,11 +3709,18 @@ class AnnotationCanvas(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         
-        # 1. 绘制边框颜色（填充整个大背景）
+        # 1. 绘制边框（只绘制四条边，不覆盖底图区域以保留透明）
         if bw > 0:
             painter.setBrush(self.image_border_color)
             painter.setPen(Qt.NoPen)
-            painter.drawRect(0, 0, final_w, final_h)
+            # 上边框
+            painter.drawRect(0, 0, final_w, bw)
+            # 下边框
+            painter.drawRect(0, final_h - bw, final_w, bw)
+            # 左边框
+            painter.drawRect(0, bw, bw, h)
+            # 右边框
+            painter.drawRect(final_w - bw, bw, bw, h)
             
         # 2. 绘制原始底图
         painter.drawPixmap(bw, bw, self.base_pixmap)
@@ -3607,7 +3911,7 @@ class AnnotationCanvas(QWidget):
     def _update_pointer_feedback(self, pos: QPoint):
         if self._marker_dragging:
             return
-        if self.tool == Tool.SELECTION:
+        if self.tool == Tool.SELECTION or self.tool == Tool.CROP:
             if self.selection_rect:
                 handle = self._selection_handle_hit_test(pos)
                 if handle in ("top-left", "bottom-right"):
@@ -3645,12 +3949,81 @@ class AnnotationCanvas(QWidget):
         self._set_hover_marker(None)
         self._update_default_cursor()
 
+    def perform_crop(self, rect: QRect):
+        """执行裁切：裁剪底图并平移所有标注"""
+        if not rect.isValid() or rect.isEmpty():
+            return
+        
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H-UNDO",
+            location="screenshot_tool.py:AnnotationCanvas.perform_crop",
+            message="perform_crop called, pushing undo state",
+            data={
+                "crop_rect": [rect.x(), rect.y(), rect.width(), rect.height()],
+                "current_pixmap_size": [self.base_pixmap.width(), self.base_pixmap.height()],
+                "stack_size_before": len(self._undo_stack),
+            },
+        )
+        # endregion
+        self._push_undo_state()
+        
+        # 1. 裁剪底图
+        new_pixmap = self.base_pixmap.copy(rect)
+        self.base_pixmap = new_pixmap
+        
+        # 2. 计算偏移量
+        offset = rect.topLeft()
+        
+        # 3. 平移并过滤矩形
+        new_rects = []
+        for r in self.rectangles:
+            new_r = r.copy()
+            # 平移矩形坐标
+            translated_rect = r['rect'].translated(-offset)
+            # 只保留与新视图有交集的部分
+            intersected = translated_rect.intersected(QRect(0, 0, new_pixmap.width(), new_pixmap.height()))
+            if not intersected.isEmpty() and intersected.width() > 2 and intersected.height() > 2:
+                new_r['rect'] = intersected
+                new_rects.append(new_r)
+        self.rectangles = new_rects
+        
+        # 4. 平移并过滤标记
+        new_markers = []
+        for m in self.markers:
+            new_pos = m['pos'] - offset
+            # 只保留在新区域内的标记
+            if QRect(0, 0, new_pixmap.width(), new_pixmap.height()).contains(new_pos):
+                new_m = m.copy()
+                new_m['pos'] = new_pos
+                new_markers.append(new_m)
+        self.markers = new_markers
+        
+        # 5. 平移并过滤文字
+        new_texts = []
+        for t in self.text_items:
+            new_pos = t['pos'] - offset
+            # 简单判断基准点是否在新区域内
+            if QRect(0, 0, new_pixmap.width(), new_pixmap.height()).contains(new_pos):
+                new_t = t.copy()
+                new_t['pos'] = new_pos
+                new_texts.append(new_t)
+        self.text_items = new_texts
+        
+        # 6. 重置状态
+        self.clear_active_selection()
+        self.set_tool(Tool.RECTANGLE)  # 裁切完成后恢复到标注框工具
+        self._apply_zoom()
+        self._mark_backing_store_dirty()
+        self.update()
+        self.optionsUpdated.emit()
+
     def _update_default_cursor(self):
         if self.tool == Tool.MARKER:
             self._update_cursor(Qt.CrossCursor)
         elif self.tool == Tool.TEXT:
             self._update_cursor(Qt.IBeamCursor)
-        elif self.tool == Tool.SELECTION:
+        elif self.tool == Tool.SELECTION or self.tool == Tool.CROP:
             self._update_cursor(Qt.CrossCursor)
         else:
             self._update_cursor(Qt.ArrowCursor)
@@ -3782,6 +4155,20 @@ class AnnotationTab(QWidget):
                 ]
                 for r in handles:
                     painter.drawRect(r)
+            elif kind == "crop":
+                painter.setBrush(Qt.NoBrush)
+                # 裁切图标：两个相交的 L 型（模拟裁切框）
+                painter.setPen(stroke)
+                # 左上 L
+                painter.drawLine(int(sc(10)), int(sc(18)), int(sc(10)), int(sc(10)))
+                painter.drawLine(int(sc(10)), int(sc(10)), int(sc(18)), int(sc(10)))
+                # 右下 L
+                painter.drawLine(int(sc(30)), int(sc(38)), int(sc(38)), int(sc(38)))
+                painter.drawLine(int(sc(38)), int(sc(38)), int(sc(38)), int(sc(30)))
+                # 虚线矩形
+                p2 = QPen(QColor(stroke_color), sc(1.5), Qt.DashLine)
+                painter.setPen(p2)
+                painter.drawRect(rectf(14, 14, 20, 20))
             elif kind == "clear":
                 painter.save()
                 painter.translate(sc(6), -sc(1))
@@ -3881,6 +4268,14 @@ class AnnotationTab(QWidget):
                 background: #f7b500;
                 color: #060606;
             }
+            QToolBar#AnnotationToolbar QToolButton#Tool_crop {
+                background: rgba(185,28,28,0.18);
+                color: #991b1b;
+            }
+            QToolBar#AnnotationToolbar QToolButton#Tool_crop:checked {
+                background: #dc2626;
+                color: #ffffff;
+            }
             """
         )
 
@@ -3922,6 +4317,15 @@ class AnnotationTab(QWidget):
         if select_button:
             select_button.setObjectName("Tool_select")
 
+        crop_action = QAction("裁切", self)
+        crop_action.setIcon(_make_tool_icon("crop", "#fee2e2", "#b91c1c"))
+        crop_action.setCheckable(True)
+        crop_action.triggered.connect(lambda: self._set_tool(Tool.CROP))
+        toolbar.addAction(crop_action)
+        crop_button = toolbar.widgetForAction(crop_action)
+        if crop_button:
+            crop_button.setObjectName("Tool_crop")
+
         clear_action = QAction("清除标注", self)
         clear_action.setIcon(_make_tool_icon("clear", "#e5e7eb", "#111827"))
         clear_action.triggered.connect(self.canvas.clear_annotations)
@@ -3952,6 +4356,7 @@ class AnnotationTab(QWidget):
             Tool.MARKER: marker_action,
             Tool.TEXT: text_action,
             Tool.SELECTION: select_action,
+            Tool.CROP: crop_action,
         }
         layout.addWidget(toolbar)
 
@@ -3969,12 +4374,25 @@ class AnnotationTab(QWidget):
         self.panel_stack.addWidget(self.marker_panel)
         self.panel_stack.addWidget(self.rectangle_panel)
         self.panel_stack.addWidget(self.text_panel)
+        
+        # 裁切选项面板（复用选区面板样式）
+        self.crop_panel = QFrame()
+        self.crop_panel.setObjectName("CropPanel")
+        self.crop_panel.setStyleSheet("background: rgba(185,28,28,0.08); border-radius: 10px;")
+        crop_layout = QHBoxLayout(self.crop_panel)
+        crop_layout.setContentsMargins(12, 8, 12, 8)
+        crop_lbl = QLabel("裁切模式: 拖动边缘选择区域，松开鼠标立即裁切")
+        crop_lbl.setStyleSheet("color: #b91c1c; font-weight: bold; font-size: 12px;")
+        crop_layout.addWidget(crop_lbl)
+        crop_layout.addStretch()
+        self.panel_stack.addWidget(self.crop_panel)
 
         stack_height = max(
             self.selection_panel.sizeHint().height(),
             self.marker_panel.sizeHint().height(),
             self.rectangle_panel.sizeHint().height(),
             self.text_panel.sizeHint().height(),
+            self.crop_panel.sizeHint().height(),
         )
         self.panel_stack.setFixedHeight(stack_height)
         self._options_placeholder.setFixedHeight(stack_height)
@@ -4219,6 +4637,18 @@ class AnnotationTab(QWidget):
     def _set_tool(self, tool: Tool):
         previous = getattr(self, "_current_tool", None)
         self._current_tool = tool
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H1-H5",
+            location="screenshot_tool.py:AnnotationTab._set_tool",
+            message="tool changed",
+            data={
+                "previous_tool": previous.name if previous else None,
+                "new_tool": tool.name if tool else None,
+                "is_crop": tool == Tool.CROP,
+            },
+        )
+        # endregion
         self.canvas.clear_active_selection(emit=False)
         self.canvas.set_tool(tool)
         self._sync_tool_action_checks(tool)
@@ -4269,17 +4699,21 @@ class AnnotationTab(QWidget):
             self.zoom_label.setText(f"{percent}%")
 
     def _update_panel_visibility(self, preferred=None):
-        kind = self.canvas.active_selection_kind()
-        if kind == "pixel_selection":
-            target = Tool.SELECTION
-        elif kind == "marker":
-            target = Tool.MARKER
-        elif kind == "rectangle":
-            target = Tool.RECTANGLE
-        elif kind == "text":
-            target = Tool.TEXT
+        # 如果当前工具是 CROP，优先保持 CROP 状态
+        if self._current_tool == Tool.CROP:
+            target = Tool.CROP
         else:
-            target = preferred or self._current_tool
+            kind = self.canvas.active_selection_kind()
+            if kind == "pixel_selection":
+                target = Tool.SELECTION
+            elif kind == "marker":
+                target = Tool.MARKER
+            elif kind == "rectangle":
+                target = Tool.RECTANGLE
+            elif kind == "text":
+                target = Tool.TEXT
+            else:
+                target = preferred or self._current_tool
         if target == Tool.MARKER:
             self.panel_stack.setCurrentWidget(self.marker_panel)
             self._set_panel_active_state(marker=True)
@@ -4292,10 +4726,13 @@ class AnnotationTab(QWidget):
         elif target == Tool.TEXT:
             self.panel_stack.setCurrentWidget(self.text_panel)
             self._set_panel_active_state(text=True)
+        elif target == Tool.CROP:
+            self.panel_stack.setCurrentWidget(self.crop_panel)
+            self._set_panel_active_state()
         else:
             self.panel_stack.setCurrentWidget(self._options_placeholder)
             self._set_panel_active_state()
-        tracking = target if target in (Tool.MARKER, Tool.RECTANGLE, Tool.TEXT, Tool.SELECTION) else Tool.NONE
+        tracking = target if target in (Tool.MARKER, Tool.RECTANGLE, Tool.TEXT, Tool.SELECTION, Tool.CROP) else Tool.NONE
         self._sync_tool_action_checks(tracking)
 
     def _set_panel_active_state(self, marker=False, rectangle=False, text=False, selection=False):
