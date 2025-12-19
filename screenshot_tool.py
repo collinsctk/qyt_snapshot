@@ -5121,7 +5121,8 @@ class AnnotationWorkspacePage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(0, self.restore_last_active_tab)
+        # 页面显示时不自动触发 restore_last_active_tab 的滚动逻辑
+        # QTimer.singleShot(0, self.restore_last_active_tab)
 
     def _remember_active_tab(self, index):
         try:
@@ -5141,15 +5142,17 @@ class AnnotationWorkspacePage(QWidget):
         if target != self.tabs.currentIndex():
             with self._preserve_tab_scroll():
                 self.tabs.setCurrentIndex(target)
-        self._restore_tab_scroll_anchor()
+        # 移除此处的自动恢复锚点调用，避免切换页面时标签栏跳动
+        # self._restore_tab_scroll_anchor()
         self._apply_shared_tool_to_tab(self.tabs.widget(target))
 
     def _on_tab_switched(self, index):
         self._remember_active_tab(index)
         self._apply_shared_tool_to_tab()
-        if not self._tab_scroll_lock:
-            self._tab_scroll_last_cause = "tab_switched"
-            QTimer.singleShot(0, self._update_tab_scroll_anchor)
+        # 移除切换标签时的自动锚点更新逻辑，让位置保持在用户手动滚动的地方
+        # if not self._tab_scroll_lock:
+        #    self._tab_scroll_last_cause = "tab_switched"
+        #    QTimer.singleShot(0, self._update_tab_scroll_anchor)
         # region agent log
         _agent_debug_log(
             hypothesisId="H6",
@@ -5523,47 +5526,24 @@ class AnnotationWorkspacePage(QWidget):
         index = self.tabs.indexOf(tab)
         if index == -1:
             return
-        # region agent log
-        offset_before = self._current_scroll_offset()
-        visible_before = self._tab_visible_range()
-        _agent_debug_log(
-            hypothesisId="H2",
-            location="screenshot_tool.py:AnnotationWorkspacePage._update_tab_color",
-            message="update_tab_color begin",
-            data={
-                "index": index,
-                "dirty": dirty,
-                "offset_before": offset_before,
-                "visible_before": visible_before,
-                "currentIndex": self.tabs.currentIndex(),
-            },
-        )
-        # endregion
+        
+        # 核心改进：不再添加 "*" 前缀，仅通过颜色区分状态。
+        # 这样标签的宽度永远保持一致，彻底解决 Qt 重新布局导致的“抖动”问题。
         color = QColor("#f97316") if dirty else QColor("#0f172a")
         self.tabs.tabBar().setTabTextColor(index, color)
-        base_label = getattr(tab, "_base_label", self.tabs.tabText(index).lstrip("* ").strip())
-        prefix = "* " if dirty else ""
-        self.tabs.setTabText(index, f"{prefix}{base_label}")
-        full_label = getattr(tab, "_full_label", base_label)
+        
+        # 如果当前标签还残留有旧逻辑添加的 "*"，则清理掉它。
+        current_text = self.tabs.tabText(index)
+        if current_text.startswith("* "):
+            base_label = getattr(tab, "_base_label", current_text.lstrip("* ").strip())
+            self.tabs.setTabText(index, base_label)
+        
+        # 更新 ToolTip (保持不变)
         try:
+            full_label = getattr(tab, "_full_label", current_text.lstrip("* ").strip())
             self.tabs.tabBar().setTabToolTip(index, full_label)
         except Exception:
             pass
-        # region agent log
-        offset_after = self._current_scroll_offset()
-        visible_after = self._tab_visible_range()
-        _agent_debug_log(
-            hypothesisId="H2",
-            location="screenshot_tool.py:AnnotationWorkspacePage._update_tab_color",
-            message="update_tab_color end",
-            data={
-                "index": index,
-                "offset_after": offset_after,
-                "visible_after": visible_after,
-                "offset_changed": offset_before != offset_after,
-            },
-        )
-        # endregion
 
     def set_image_quality(self, value):
         self._image_quality = self._clamp_quality(value)
@@ -5985,8 +5965,9 @@ class ScreenSnapApp(QMainWindow):
             self.workspace_page.restore_last_active_tab()
 
     def _on_app_state_changed(self, state):
-        if state == Qt.ApplicationActive and hasattr(self, "workspace_page"):
-            self.workspace_page.restore_last_active_tab()
+        # 当应用程序重新获得焦点时，不再强制恢复标签位置，
+        # 这样当你去别的窗口“贴图”再回来时，标签栏会保持在你离开时的样子。
+        pass
 
     def _update_nav_state(self):
         for key, action in self.nav_actions.items():
