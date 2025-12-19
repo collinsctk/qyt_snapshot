@@ -9,9 +9,40 @@ import re
 import sys
 import time
 import tempfile
+import logging
+import atexit
+import signal
 import winreg
+from urllib.parse import urlparse
 from datetime import datetime
 from enum import Enum, auto
+from contextlib import contextmanager
+
+# region agent log helpers
+# Debug Mode: 运行时证据日志（NDJSON），写入 Cursor 提供的固定路径
+_AGENT_DEBUG_LOG_PATH = r"c:\Users\ThinkPad\CursorProjects\snapshot\.cursor\debug.log"
+_AGENT_DEBUG_SESSION_ID = "debug-session"
+
+
+def _agent_debug_log(*, hypothesisId: str, location: str, message: str, data=None, runId: str = "pre-fix"):
+    """写入 NDJSON 调试日志（避免写入任何敏感信息/PII）。"""
+    try:
+        payload = {
+            "timestamp": int(time.time() * 1000),
+            "sessionId": _AGENT_DEBUG_SESSION_ID,
+            "runId": runId,
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data or {},
+        }
+        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        # 调试日志绝不影响主流程
+        pass
+
+# endregion
 
 try:
     from openai import OpenAI
@@ -34,6 +65,8 @@ from PyQt5.QtCore import (
     QIODevice,
     QThread,
     QMimeData,
+    qInstallMessageHandler,
+    QtMsgType,
 )
 from PyQt5.QtGui import (
     QColor,
@@ -83,6 +116,7 @@ from PyQt5.QtWidgets import (
     QFrame,
     QSizePolicy,
     QCheckBox,
+    QToolButton,
     QSystemTrayIcon,
     QMenu,
     QPlainTextEdit,
@@ -118,6 +152,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LEGACY_USER_CONFIG_FILE = os.path.join(BASE_DIR, "user.json")
 USER_CONFIG_FILE = os.path.join(USER_DATA_DIR, "user.json")
 DEFAULT_SAVE_DIR = os.path.join(USER_DATA_DIR, "screenshots")
+LOG_FILE = os.path.join(USER_DATA_DIR, "snapshot.log")
 ICON_PATH = os.path.join(BASE_DIR, "favicon", "favicon.ico")
 _APP_ICON = None
 CLASSIC_COLORS = [
@@ -252,6 +287,50 @@ def _sanitize_font_family(family: str) -> str:
         return family
     return _preferred_font_family()
 
+
+def _setup_logging():
+    try:
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
+    except Exception:
+        pass
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    def _excepthook(exc_type, exc, tb):
+        logging.exception("Uncaught exception", exc_info=(exc_type, exc, tb))
+        try:
+            sys.__excepthook__(exc_type, exc, tb)
+        except Exception:
+            pass
+
+    def _qt_msg_handler(mode, context, message):
+        try:
+            level = {
+                QtMsgType.QtDebugMsg: logging.DEBUG,
+                QtMsgType.QtInfoMsg: logging.INFO,
+                QtMsgType.QtWarningMsg: logging.WARNING,
+                QtMsgType.QtCriticalMsg: logging.ERROR,
+                QtMsgType.QtFatalMsg: logging.CRITICAL,
+            }.get(mode, logging.INFO)
+            logging.log(level, f"Qt: {message}")
+        except Exception:
+            pass
+
+    sys.excepthook = _excepthook
+    try:
+        qInstallMessageHandler(_qt_msg_handler)
+    except Exception:
+        pass
+    logging.info("Logging initialized")
+
+    def _on_exit():
+        logging.info("Process exiting")
+
+    atexit.register(_on_exit)
+
 def _shorten_label(text: str, max_len: int = None) -> str:
     if max_len is None:
         try:
@@ -361,6 +440,7 @@ class SingleInstanceGuard:
 
 
 def _notify_instance_running():
+    logging.warning("Detected existing instance; exiting without starting UI.")
     flags = 0x00000030 | 0x00001000 | 0x00010000 | 0x00040000
     try:
         USER32.MessageBoxW(
@@ -513,7 +593,35 @@ def _set_rich_clipboard(text: str):
     if html_text:
         mime.setHtml(html_text)
     mime.setText(text or "")
-    QApplication.clipboard().setMimeData(mime)
+    return _set_clipboard_mime_with_retry(mime)
+
+
+def _set_clipboard_with_retry(setter, attempts=3, delay=0.12):
+    last_exc = None
+    for _ in range(max(1, attempts)):
+        try:
+            setter()
+            return True
+        except Exception as exc:
+            last_exc = exc
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+            time.sleep(delay)
+    return False
+
+
+def _set_clipboard_mime_with_retry(mime: QMimeData, attempts=3, delay=0.12):
+    return _set_clipboard_with_retry(lambda: QApplication.clipboard().setMimeData(mime), attempts, delay)
+
+
+def _set_clipboard_pixmap_with_retry(pixmap: QPixmap, attempts=3, delay=0.12):
+    return _set_clipboard_with_retry(lambda: QApplication.clipboard().setPixmap(pixmap), attempts, delay)
+
+
+def _set_clipboard_text_with_retry(text: str, attempts=3, delay=0.12):
+    return _set_clipboard_with_retry(lambda: QApplication.clipboard().setText(text or ""), attempts, delay)
 
 
 class AITranslationService:
@@ -539,6 +647,24 @@ class AITranslationService:
         return self._client
 
     def translate_image(self, image_bytes: bytes, prompt=AI_TRANSLATION_PROMPT):
+        # region agent log
+        # H7: 用户仅“处理图片”时是否被意外触发了 AI 识别/翻译（看起来像自动 OCR）
+        try:
+            base_url = (self.settings or {}).get("base_url", "")
+            host = urlparse(base_url).netloc if base_url else ""
+        except Exception:
+            host = ""
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:AITranslationService.translate_image",
+            message="translate_image called",
+            data={
+                "image_bytes_len": len(image_bytes) if image_bytes else 0,
+                "model": (self.settings or {}).get("model", ""),
+                "base_url_host": host,
+            },
+        )
+        # endregion
         if not image_bytes:
             raise ValueError("截图内容为空，无法识别")
         client = self._ensure_client()
@@ -736,12 +862,40 @@ class AITranslationWorker(QThread):
         self._settings = settings
 
     def run(self):
+        # region agent log
+        # H7: AI worker 是否在你未点击“AI 截图翻译”时启动
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:AITranslationWorker.run",
+            message="AITranslationWorker started",
+            data={"image_bytes_len": len(self._image_bytes) if getattr(self, "_image_bytes", None) else 0},
+        )
+        # endregion
         try:
             service = AITranslationService(self._settings)
             original, translation, _ = service.translate_image(self._image_bytes)
             self.completed.emit(original, translation)
+            # region agent log
+            _agent_debug_log(
+                hypothesisId="H7",
+                location="screenshot_tool.py:AITranslationWorker.run",
+                message="AITranslationWorker completed",
+                data={
+                    "original_len": len(original) if original else 0,
+                    "translation_len": len(translation) if translation else 0,
+                },
+            )
+            # endregion
         except Exception as exc:
             self.failed.emit(str(exc))
+            # region agent log
+            _agent_debug_log(
+                hypothesisId="H7",
+                location="screenshot_tool.py:AITranslationWorker.run",
+                message="AITranslationWorker failed",
+                data={"error": str(exc)[:200]},
+            )
+            # endregion
 
 
 class Tool(Enum):
@@ -1659,6 +1813,19 @@ class AITranslationPanel(QWidget):
         self._ai_settings = _normalized_ai_settings(settings or {})
 
     def add_capture(self, pixmap: QPixmap):
+        # region agent log
+        # H7: 只要这里被调用，就等同于“开始 AI 识别/翻译”（用户会感觉在自动 OCR）
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:AITranslationPanel.add_capture",
+            message="AITranslationPanel.add_capture called",
+            data={
+                "configured": bool(AITranslationService.is_configured(self._ai_settings)),
+                "pixmap_isNull": bool(pixmap.isNull()) if pixmap else None,
+                "pixmap_size": (pixmap.width(), pixmap.height()) if pixmap else None,
+            },
+        )
+        # endregion
         if not AITranslationService.is_configured(self._ai_settings):
             self.status_label.setText("请先在系统设置 -> AI 设置中填写 base_url/API Key/模型。")
             return
@@ -1667,6 +1834,14 @@ class AITranslationPanel(QWidget):
         except Exception as exc:
             self.status_label.setText(f"图片处理失败：{exc}")
             return
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:AITranslationPanel.add_capture",
+            message="AITranslationPanel prepared image bytes",
+            data={"image_bytes_len": len(image_bytes) if image_bytes else 0},
+        )
+        # endregion
         self._tab_counter += 1
         tab = TranslationTab(self._tab_counter)
         title = f"{self._tab_counter}. 识别中"
@@ -1697,10 +1872,14 @@ class AITranslationPanel(QWidget):
             duration = time.perf_counter() - start_time
             duration_text = f"（消耗时间: {duration:.2f}秒）"
         if translation:
-            QApplication.clipboard().setText(translation)
-            self.status_label.setText(
-                f"识别完成，译文已复制到剪贴板。{duration_text}"
-            )
+            if _set_clipboard_text_with_retry(translation):
+                self.status_label.setText(
+                    f"识别完成，译文已复制到剪贴板。{duration_text}"
+                )
+            else:
+                self.status_label.setText(
+                    f"识别完成，但写入剪贴板失败，请手动复制。{duration_text}"
+                )
         else:
             self.status_label.setText(
                 f"识别完成，请手动复制需要的内容。{duration_text}"
@@ -2389,6 +2568,30 @@ class AnnotationCanvas(QWidget):
             if emit:
                 self.optionsUpdated.emit()
                 self._notify_text_selection()
+        # region agent log
+        # H1/H2: Esc 退出失败时，是否存在“拖拽状态未复位/焦点不在预期控件”的证据
+        try:
+            focus = QApplication.focusWidget()
+            focus_name = focus.__class__.__name__ if focus else None
+        except Exception:
+            focus_name = None
+        _agent_debug_log(
+            hypothesisId="H1",
+            location="screenshot_tool.py:AnnotationCanvas.clear_active_selection",
+            message="clear_active_selection called",
+            data={
+                "changed": changed,
+                "emit": bool(emit),
+                "tool": getattr(self, "tool", None).name if getattr(self, "tool", None) else None,
+                "markers_flattened": bool(getattr(self, "markers_flattened", True)),
+                "selected_marker_index": getattr(self, "selected_marker_index", None),
+                "dragging_marker_index": getattr(self, "dragging_marker_index", None),
+                "_marker_dragging": bool(getattr(self, "_marker_dragging", False)),
+                "_text_dragging": bool(getattr(self, "_text_dragging", False)),
+                "focusWidget": focus_name,
+            },
+        )
+        # endregion
         self.update()
         return changed
 
@@ -3390,6 +3593,7 @@ class AnnotationCanvas(QWidget):
                 pass
 
 class AnnotationTab(QWidget):
+    toolChanged = pyqtSignal(object)
     dirtyStateChanged = pyqtSignal(bool)
     def __init__(
         self,
@@ -3925,6 +4129,7 @@ class AnnotationTab(QWidget):
         return False
 
     def _set_tool(self, tool: Tool):
+        previous = getattr(self, "_current_tool", None)
         self._current_tool = tool
         self.canvas.clear_active_selection(emit=False)
         self.canvas.set_tool(tool)
@@ -3932,12 +4137,38 @@ class AnnotationTab(QWidget):
         self._update_panel_visibility(preferred=tool)
         if tool == Tool.TEXT and not self.canvas._has_active_text():
             self._apply_text_defaults_to_canvas()
+        if tool != previous:
+            try:
+                self.toolChanged.emit(tool)
+            except Exception:
+                pass
 
     def _handle_canvas_update(self):
         self._mark_dirty()
         self._update_panel_visibility()
     
     def _handle_escape(self):
+        # region agent log
+        # H1/H2: Esc 是否触发到了这里？当时工具/选区/拖拽/焦点是什么？
+        try:
+            focus = QApplication.focusWidget()
+            focus_name = focus.__class__.__name__ if focus else None
+        except Exception:
+            focus_name = None
+        _agent_debug_log(
+            hypothesisId="H2",
+            location="screenshot_tool.py:AnnotationTab._handle_escape",
+            message="Esc shortcut activated",
+            data={
+                "_current_tool": getattr(self, "_current_tool", None).name if getattr(self, "_current_tool", None) else None,
+                "active_selection_kind": self.canvas.active_selection_kind() if hasattr(self, "canvas") else None,
+                "markers_flattened": bool(getattr(self.canvas, "markers_flattened", True)),
+                "dragging_marker_index": getattr(self.canvas, "dragging_marker_index", None),
+                "_marker_dragging": bool(getattr(self.canvas, "_marker_dragging", False)),
+                "focusWidget": focus_name,
+            },
+        )
+        # endregion
         self.canvas.clear_active_selection()
         if self._current_tool in (Tool.MARKER, Tool.TEXT, Tool.SELECTION):
             self._set_tool(Tool.NONE)
@@ -4123,15 +4354,99 @@ class AnnotationTab(QWidget):
             QMessageBox.information(self, "无法撤销", "当前没有可撤销的操作。")
 
     def _copy_to_clipboard(self):
+        # region agent log
+        # H3/H5: 复制前的状态（尤其是 Esc 失败后的状态机）与焦点
+        try:
+            focus = QApplication.focusWidget()
+            focus_name = focus.__class__.__name__ if focus else None
+        except Exception:
+            focus_name = None
+        _agent_debug_log(
+            hypothesisId="H5",
+            location="screenshot_tool.py:AnnotationTab._copy_to_clipboard",
+            message="copy_to_clipboard begin",
+            data={
+                "_current_tool": getattr(self, "_current_tool", None).name if getattr(self, "_current_tool", None) else None,
+                "active_selection_kind": self.canvas.active_selection_kind() if hasattr(self, "canvas") else None,
+                "markers_flattened": bool(getattr(self.canvas, "markers_flattened", True)),
+                "dragging_marker_index": getattr(self.canvas, "dragging_marker_index", None),
+                "_marker_dragging": bool(getattr(self.canvas, "_marker_dragging", False)),
+                "focusWidget": focus_name,
+            },
+        )
+        # endregion
         # 临时 PNG 文件，便于部分应用（PPT/笔记）读取透明通道
         tmp_path, png_bytes, _ = self._export_clipboard_image(flatten=True)
+        # region agent log
+        # H3/H5: 临时文件与 PNG 字节是否有效（PPT 若优先读 URL，文件是否存在/大小是否为 0）
+        try:
+            exists = os.path.exists(tmp_path) if tmp_path else False
+            fsize = os.path.getsize(tmp_path) if exists else None
+        except Exception:
+            exists, fsize = False, None
+        _agent_debug_log(
+            hypothesisId="H3",
+            location="screenshot_tool.py:AnnotationTab._copy_to_clipboard",
+            message="clipboard export done",
+            data={
+                "tmp_path": tmp_path,
+                "file_exists": bool(exists),
+                "file_size": fsize,
+                "png_bytes_len": len(png_bytes) if png_bytes else 0,
+            },
+        )
+        # endregion
         mime = QMimeData()
         mime.setData("image/png", png_bytes)
         mime.setUrls([QUrl.fromLocalFile(tmp_path)])
         clipboard = QApplication.clipboard()
-        clipboard.setMimeData(mime)
-        self.status_label.setText("已复制到剪贴板")
-        self._mark_dirty()
+        ok = _set_clipboard_mime_with_retry(mime)
+        # region agent log
+        # H3: 写入剪贴板是否成功？写入后的 formats 是什么？（避免泄露内容，仅记录类型）
+        try:
+            fmts = list(clipboard.mimeData().formats()) if clipboard and clipboard.mimeData() else []
+        except Exception:
+            fmts = []
+        _agent_debug_log(
+            hypothesisId="H3",
+            location="screenshot_tool.py:AnnotationTab._copy_to_clipboard",
+            message="clipboard setMimeData result",
+            data={
+                "ok": bool(ok),
+                "formats": fmts[:20],
+                "has_image_png": "image/png" in fmts,
+                "has_urls": "text/uri-list" in fmts,
+            },
+        )
+        # endregion
+        if ok:
+            self.status_label.setText("已复制到剪贴板")
+            self._mark_dirty()
+            # region agent log
+            # H1: 复制完成后延迟检查滚动位置是否变化
+            def _delayed_scroll_check():
+                try:
+                    workspace = self.parent()
+                    while workspace and not hasattr(workspace, '_current_scroll_offset'):
+                        workspace = workspace.parent()
+                    if workspace:
+                        _agent_debug_log(
+                            hypothesisId="H1",
+                            location="screenshot_tool.py:AnnotationTab._copy_to_clipboard._delayed_scroll_check",
+                            message="copy finished delayed scroll check",
+                            data={
+                                "offset_now": workspace._current_scroll_offset(),
+                                "visible_range": workspace._tab_visible_range(),
+                                "currentIndex": workspace.tabs.currentIndex(),
+                            },
+                        )
+                except Exception:
+                    pass
+            QTimer.singleShot(50, _delayed_scroll_check)
+            # endregion
+        else:
+            self.status_label.setText("复制到剪贴板失败，请重试。")
+            QMessageBox.warning(self, "复制失败", "无法写入剪贴板，请稍后重试。")
 
     def _delete_selected(self):
         if self.canvas.selection_rect:
@@ -4739,6 +5054,12 @@ class AnnotationWorkspacePage(QWidget):
         self._display_zoom = self._clamp_zoom(default_zoom)
         self._zoom_callback = zoom_changed_callback
         self._updating_zoom = False
+        self._last_active_tab_index = -1
+        self._tab_scroll_anchor = 0
+        self._tab_scroll_offset = 0
+        self._tab_scroll_lock = False
+        self._tab_scroll_last_cause = "init"
+        self._shared_tool = None
         layout = QVBoxLayout()
 
         action_bar = QHBoxLayout()
@@ -4747,13 +5068,23 @@ class AnnotationWorkspacePage(QWidget):
         self.copy_all_btn.setToolTip("将当前打开的所有截图渲染为临时文件并写入剪贴板（微信/QQ 可一次粘贴多图）。")
         self.copy_all_btn.setEnabled(False)
         self.copy_all_btn.clicked.connect(self._copy_all_tabs_to_clipboard)
+
+        self.clear_all_btn = QPushButton("清空所有标签")
+        self.clear_all_btn.setToolTip("清空当前所有已打开的截图标签页。")
+        self.clear_all_btn.setEnabled(False)
+        self.clear_all_btn.clicked.connect(self.clear_all_tabs)
+
         action_bar.addStretch(1)
         action_bar.addWidget(self.copy_all_btn, 0, Qt.AlignRight)
+        action_bar.addWidget(self.clear_all_btn, 0, Qt.AlignRight)
         layout.addLayout(action_bar)
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
+        self.tabs.currentChanged.connect(self._on_tab_switched)
+        self.tabs.tabBar().installEventFilter(self)
+        self._install_tab_scroll_button_filters()
         layout.addWidget(self.tabs, 1)
 
         hint = QLabel("尚未添加截图，使用区域截取或重复截取后会在此显示。")
@@ -4764,6 +5095,20 @@ class AnnotationWorkspacePage(QWidget):
         self.setLayout(layout)
 
         self._update_hint_visibility()
+        self._update_tab_scroll_anchor()
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H6",
+            location="screenshot_tool.py:AnnotationWorkspacePage.__init__",
+            message="workspace init tab scroll state",
+            data={
+                "count": self.tabs.count(),
+                "offset": self._current_scroll_offset(),
+                "anchor": self._tab_scroll_anchor,
+                "lock": bool(self._tab_scroll_lock),
+            },
+        )
+        # endregion
 
     def _update_hint_visibility(self):
         has_tabs = self.tabs.count() > 0
@@ -4771,6 +5116,233 @@ class AnnotationWorkspacePage(QWidget):
         self.tabs.setVisible(has_tabs)
         if hasattr(self, "copy_all_btn"):
             self.copy_all_btn.setEnabled(has_tabs)
+        if hasattr(self, "clear_all_btn"):
+            self.clear_all_btn.setEnabled(has_tabs)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.restore_last_active_tab)
+
+    def _remember_active_tab(self, index):
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return
+        if index >= 0:
+            self._last_active_tab_index = index
+
+    def restore_last_active_tab(self):
+        if self._last_active_tab_index < 0:
+            return
+        max_idx = self.tabs.count() - 1
+        if max_idx < 0:
+            return
+        target = min(self._last_active_tab_index, max_idx)
+        if target != self.tabs.currentIndex():
+            with self._preserve_tab_scroll():
+                self.tabs.setCurrentIndex(target)
+        self._restore_tab_scroll_anchor()
+        self._apply_shared_tool_to_tab(self.tabs.widget(target))
+
+    def _on_tab_switched(self, index):
+        self._remember_active_tab(index)
+        self._apply_shared_tool_to_tab()
+        if not self._tab_scroll_lock:
+            self._tab_scroll_last_cause = "tab_switched"
+            QTimer.singleShot(0, self._update_tab_scroll_anchor)
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H6",
+            location="screenshot_tool.py:AnnotationWorkspacePage._on_tab_switched",
+            message="tab switched",
+            data={
+                "index": index,
+                "count": self.tabs.count(),
+                "offset_now": self._current_scroll_offset(),
+                "visible_range": self._tab_visible_range(),
+                "lock": bool(self._tab_scroll_lock),
+            },
+        )
+        # endregion
+
+    def _install_tab_scroll_button_filters(self):
+        left, right = self._tab_scroll_buttons()
+        for btn in (left, right):
+            if btn:
+                btn.installEventFilter(self)
+
+    def _tab_scroll_buttons(self):
+        bar = self.tabs.tabBar()
+        left = right = None
+        for btn in bar.findChildren(QToolButton):
+            arrow = btn.arrowType() if hasattr(btn, "arrowType") else None
+            if arrow == Qt.LeftArrow:
+                left = btn
+            elif arrow == Qt.RightArrow:
+                right = btn
+        return left, right
+
+    def _tab_visible_range(self):
+        bar = self.tabs.tabBar()
+        count = bar.count()
+        if count == 0:
+            return (0, -1)
+        width = bar.width()
+        first = 0
+        last = count - 1
+        for i in range(count):
+            rect = bar.tabRect(i)
+            if rect.right() >= 0:
+                first = i
+                break
+        for i in range(count - 1, -1, -1):
+            rect = bar.tabRect(i)
+            if rect.left() <= width:
+                last = i
+                break
+        return (first, last)
+
+    @contextmanager
+    def _preserve_tab_scroll(self):
+        if not self._tab_scroll_lock:
+            self._update_tab_scroll_anchor()
+        anchor = self._tab_scroll_anchor
+        offset = self._tab_scroll_offset
+        self._tab_scroll_lock = True
+        try:
+            yield
+        finally:
+            self._tab_scroll_anchor = anchor
+            self._tab_scroll_offset = offset
+            self._tab_scroll_lock = False
+            QTimer.singleShot(0, self._restore_tab_scroll_anchor)
+
+    def _current_scroll_offset(self):
+        bar = self.tabs.tabBar()
+        if bar.count() == 0:
+            return 0
+        try:
+            return max(0, -bar.tabRect(0).left())
+        except Exception:
+            return 0
+
+    def _apply_scroll_offset(self, target_offset, max_steps=400):
+        left, right = self._tab_scroll_buttons()
+        if not (left or right):
+            return
+        guard = 0
+        def _can_move(direction):
+            return (left.isEnabled() if direction < 0 else right.isEnabled()) if (left and right) else True
+        while guard < max_steps:
+            guard += 1
+            current = self._current_scroll_offset()
+            delta = target_offset - current
+            if abs(delta) <= 2:
+                break
+            if delta > 0 and right and _can_move(1):
+                right.click()
+            elif delta < 0 and left and _can_move(-1):
+                left.click()
+            else:
+                break
+            QApplication.processEvents()
+
+    def _apply_shared_tool_to_tab(self, tab=None):
+        tool = self._shared_tool
+        if tool is None:
+            return
+        target = tab or self.tabs.currentWidget()
+        if target and hasattr(target, "_current_tool") and hasattr(target, "_set_tool"):
+            if target._current_tool != tool:
+                try:
+                    target._set_tool(tool)
+                except Exception:
+                    pass
+
+    def _on_tab_tool_changed(self, tool):
+        if tool is None:
+            return
+        self._shared_tool = tool
+
+    def _update_tab_scroll_anchor(self):
+        if self._tab_scroll_lock:
+            return
+        first, _ = self._tab_visible_range()
+        self._tab_scroll_anchor = first
+        self._tab_scroll_offset = self._current_scroll_offset()
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H6",
+            location="screenshot_tool.py:AnnotationWorkspacePage._update_tab_scroll_anchor",
+            message="update tab scroll anchor",
+            data={
+                "cause": getattr(self, "_tab_scroll_last_cause", None),
+                "count": self.tabs.count(),
+                "stored_anchor": self._tab_scroll_anchor,
+                "stored_offset": self._tab_scroll_offset,
+                "visible_range": self._tab_visible_range(),
+                "currentIndex": self.tabs.currentIndex(),
+            },
+        )
+        # endregion
+
+    def _restore_tab_scroll_anchor(self):
+        count = self.tabs.count()
+        if count == 0:
+            return
+        anchor = min(max(0, self._tab_scroll_anchor), count - 1)
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H6",
+            location="screenshot_tool.py:AnnotationWorkspacePage._restore_tab_scroll_anchor",
+            message="restore tab scroll anchor begin",
+            data={
+                "count": count,
+                "anchor": anchor,
+                "stored_offset": self._tab_scroll_offset,
+                "offset_now": self._current_scroll_offset(),
+                "visible_range": self._tab_visible_range(),
+                "currentIndex": self.tabs.currentIndex(),
+            },
+        )
+        # endregion
+        self._apply_scroll_offset(self._tab_scroll_offset)
+        left, right = self._tab_scroll_buttons()
+        first, last = self._tab_visible_range()
+        guard = 0
+        while anchor < first and left and left.isEnabled() and guard < 200:
+            left.click()
+            QApplication.processEvents()
+            first, last = self._tab_visible_range()
+            guard += 1
+        while anchor > last and right and right.isEnabled() and guard < 400:
+            right.click()
+            QApplication.processEvents()
+            first, last = self._tab_visible_range()
+            guard += 1
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H6",
+            location="screenshot_tool.py:AnnotationWorkspacePage._restore_tab_scroll_anchor",
+            message="restore tab scroll anchor end",
+            data={
+                "offset_now": self._current_scroll_offset(),
+                "visible_range": self._tab_visible_range(),
+                "guard": guard,
+            },
+        )
+        # endregion
+
+    def eventFilter(self, obj, event):
+        if obj in (self.tabs.tabBar(),) or obj in self._tab_scroll_buttons():
+            if event.type() in (QEvent.Wheel, QEvent.MouseButtonRelease, QEvent.MouseButtonDblClick):
+                if not self._tab_scroll_lock:
+                    if obj in self._tab_scroll_buttons():
+                        self._tab_scroll_last_cause = "scroll_button_or_release"
+                    else:
+                        self._tab_scroll_last_cause = "tabbar_input"
+                    QTimer.singleShot(0, self._update_tab_scroll_anchor)
+        return super().eventFilter(obj, event)
 
     def _copy_all_tabs_to_clipboard(self):
         tabs = list(self._iter_tabs())
@@ -4799,7 +5371,9 @@ class AnnotationWorkspacePage(QWidget):
         mime.setUrls([QUrl.fromLocalFile(path) for path, _ in payloads])
         if payloads[0][1]:
             mime.setData("image/png", payloads[0][1])
-        QApplication.clipboard().setMimeData(mime)
+        if not _set_clipboard_mime_with_retry(mime):
+            QMessageBox.warning(self, "复制失败", "无法写入剪贴板，请稍后重试。")
+            return
         copied_msg = f"已将 {len(payloads)} 张图片复制为文件到剪贴板"
         current_tab = self.tabs.currentWidget()
         if current_tab and hasattr(current_tab, "status_label"):
@@ -4837,7 +5411,11 @@ class AnnotationWorkspacePage(QWidget):
             if hasattr(widget, "maybe_close") and not widget.maybe_close():
                 return
             widget.deleteLater()
-        self.tabs.removeTab(index)
+        with self._preserve_tab_scroll():
+            self.tabs.removeTab(index)
+            self._remember_active_tab(self.tabs.currentIndex())
+        self._install_tab_scroll_button_filters()
+        QTimer.singleShot(0, self._restore_tab_scroll_anchor)
         self._update_hint_visibility()
 
     def maybe_close_all(self):
@@ -4859,6 +5437,48 @@ class AnnotationWorkspacePage(QWidget):
             return self.save_all_dirty()
         return True
 
+    def clear_all_tabs(self):
+        """清空所有标签页，并根据需要确认保存"""
+        dirty_tabs = self.get_dirty_tabs()
+        if dirty_tabs:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("清空所有标签")
+            box.setText("当前有未保存的截图，选择操作：")
+            save_btn = box.addButton("保存并清空", QMessageBox.AcceptRole)
+            discard_btn = box.addButton("不保存直接清空", QMessageBox.DestructiveRole)
+            cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked == cancel_btn:
+                return
+            if clicked == save_btn:
+                if not self.save_all_dirty():
+                    return
+        else:
+            if self.tabs.count() > 0:
+                reply = QMessageBox.question(
+                    self,
+                    "确认清空",
+                    "是否确定清空所有已打开的标签页？",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+
+        # 批量移除所有标签
+        with self._preserve_tab_scroll():
+            while self.tabs.count() > 0:
+                widget = self.tabs.widget(0)
+                if widget:
+                    widget.deleteLater()
+                self.tabs.removeTab(0)
+            self._remember_active_tab(-1)
+
+        self._update_hint_visibility()
+        self._install_tab_scroll_button_filters()
+        QTimer.singleShot(0, self._restore_tab_scroll_anchor)
+
     def _create_tab(self, pixmap, save_dir, source_path=None, initial_zoom=1.0):
         tab = AnnotationTab(
             pixmap,
@@ -4876,14 +5496,19 @@ class AnnotationWorkspacePage(QWidget):
         short_label = _shorten_label(full_label, short_len)
         tab._base_label = short_label
         tab._full_label = full_label
-        idx = self.tabs.addTab(tab, short_label)
-        if hasattr(self.tabs, "tabBar"):
-            try:
-                self.tabs.tabBar().setTabToolTip(idx, full_label)
-            except Exception:
-                pass
-        self._bind_tab_signals(tab)
-        self.tabs.setCurrentWidget(tab)
+        with self._preserve_tab_scroll():
+            idx = self.tabs.addTab(tab, short_label)
+            if hasattr(self.tabs, "tabBar"):
+                try:
+                    self.tabs.tabBar().setTabToolTip(idx, full_label)
+                except Exception:
+                    pass
+            self._bind_tab_signals(tab)
+            self.tabs.setCurrentWidget(tab)
+            self._remember_active_tab(self.tabs.currentIndex())
+        self._install_tab_scroll_button_filters()
+        self._apply_shared_tool_to_tab(tab)
+        QTimer.singleShot(0, self._restore_tab_scroll_anchor)
         self._update_hint_visibility()
 
     def _bind_tab_signals(self, tab):
@@ -4891,11 +5516,29 @@ class AnnotationWorkspacePage(QWidget):
         self._update_tab_color(tab, tab.dirty)
         if hasattr(tab, "canvas"):
             tab.canvas.zoomChanged.connect(lambda factor, t=tab: self._handle_tab_zoom(factor, t))
+        if hasattr(tab, "toolChanged"):
+            tab.toolChanged.connect(self._on_tab_tool_changed)
 
     def _update_tab_color(self, tab, dirty):
         index = self.tabs.indexOf(tab)
         if index == -1:
             return
+        # region agent log
+        offset_before = self._current_scroll_offset()
+        visible_before = self._tab_visible_range()
+        _agent_debug_log(
+            hypothesisId="H2",
+            location="screenshot_tool.py:AnnotationWorkspacePage._update_tab_color",
+            message="update_tab_color begin",
+            data={
+                "index": index,
+                "dirty": dirty,
+                "offset_before": offset_before,
+                "visible_before": visible_before,
+                "currentIndex": self.tabs.currentIndex(),
+            },
+        )
+        # endregion
         color = QColor("#f97316") if dirty else QColor("#0f172a")
         self.tabs.tabBar().setTabTextColor(index, color)
         base_label = getattr(tab, "_base_label", self.tabs.tabText(index).lstrip("* ").strip())
@@ -4906,6 +5549,21 @@ class AnnotationWorkspacePage(QWidget):
             self.tabs.tabBar().setTabToolTip(index, full_label)
         except Exception:
             pass
+        # region agent log
+        offset_after = self._current_scroll_offset()
+        visible_after = self._tab_visible_range()
+        _agent_debug_log(
+            hypothesisId="H2",
+            location="screenshot_tool.py:AnnotationWorkspacePage._update_tab_color",
+            message="update_tab_color end",
+            data={
+                "index": index,
+                "offset_after": offset_after,
+                "visible_after": visible_after,
+                "offset_changed": offset_before != offset_after,
+            },
+        )
+        # endregion
 
     def set_image_quality(self, value):
         self._image_quality = self._clamp_quality(value)
@@ -4978,7 +5636,7 @@ class CaptureOverlay(QWidget):
 
     def __init__(self, screenshot: QPixmap, origin: QPoint, screen):
         super().__init__()
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setWindowState(Qt.WindowFullScreen)
         self.setCursor(Qt.CrossCursor)
         self.screenshot = screenshot
@@ -4989,28 +5647,42 @@ class CaptureOverlay(QWidget):
         self.origin = None
         self.cursor_pos = None
         self.setMouseTracking(True)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        # 移除 WA_TranslucentBackground，确保它是一个完全不透明的静态显示层
+        # self.setAttribute(Qt.WA_TranslucentBackground) 
+        
         self._cursor_timer = QTimer(self)
         self._cursor_timer.setInterval(16)
         self._cursor_timer.timeout.connect(self._sync_cursor_position)
         self._cursor_timer.start()
         self._sync_cursor_position(force=True)
-        self._scale_x = self._compute_scale(self.screenshot.width(), self.width())
-        self._scale_y = self._compute_scale(self.screenshot.height(), self.height())
+        # 核心修复：直接使用屏幕的逻辑几何尺寸 (geo) 进行比例换算，而不是 self.width()
+        # 这样可以 100% 准确地适配 100%, 125%, 150%, 200% 等所有缩放比例
+        self._scale_x = self._compute_scale(self.screenshot.width(), geo.width())
+        self._scale_y = self._compute_scale(self.screenshot.height(), geo.height())
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        # 启用平滑缩放以适应高 DPI
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        
+        # 1. 绘制完整的静态底图（填充整个物理窗口）
         painter.drawPixmap(self.rect(), self.screenshot)
 
+        # 2. 绘制一层半透明黑色遮罩
         overlay_color = QColor(0, 0, 0, 120)
         painter.fillRect(self.rect(), overlay_color)
 
-        if self.selection:
-            painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            painter.fillRect(self.selection, Qt.transparent)
-            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        # 3. 如果有选区，在高亮区重新绘制底图
+        if self.selection and self.selection.isValid():
+            # 这里必须使用逻辑坐标到物理像素的映射
+            # 我们直接从 screenshot 中截取对应的部分并画到逻辑位置上
+            device_rect = self._device_rect(self.selection)
+            painter.drawPixmap(self.selection, self.screenshot, device_rect)
+            
+            # 画选区边框
             painter.setPen(QPen(QColor(30, 144, 255), 2))
             painter.drawRect(self.selection)
+        
         self._draw_magnifier(painter)
 
     def mousePressEvent(self, event):
@@ -5046,46 +5718,33 @@ class CaptureOverlay(QWidget):
     def _draw_magnifier(self, painter: QPainter):
         if self.cursor_pos is None:
             return
+        
+        # 放大镜源代码区域大小（逻辑像素）
         src_half = 16
         size = QSize(src_half * 2, src_half * 2)
         logical_rect = QRect(
             QPoint(self.cursor_pos.x() - src_half, self.cursor_pos.y() - src_half),
             size,
         )
-        desired_device_rect = self._logical_device_rect(logical_rect)
-        source_rect = desired_device_rect.intersected(self.screenshot.rect())
+        
+        # 转换为物理像素坐标
+        source_rect = self._device_rect(logical_rect)
         if source_rect.isEmpty():
             return
 
-        target_width = desired_device_rect.width()
-        target_height = desired_device_rect.height()
-        if target_width <= 0 or target_height <= 0:
+        # 截取底图中的对应像素
+        snippet = self.screenshot.copy(source_rect)
+        if snippet.isNull():
             return
 
-        # Pad out-of-bounds areas so the magnifier center still points at the real cursor on screen edges.
-        base_color = self.screenshot.toImage().pixelColor(
-            max(0, min(source_rect.x(), self.screenshot.width() - 1)),
-            max(0, min(source_rect.y(), self.screenshot.height() - 1)),
-        )
-        padded = QImage(QSize(target_width, target_height), QImage.Format_ARGB32)
-        padded.fill(base_color)
-
-        snippet = self.screenshot.copy(source_rect)
-        cursor_device = self._logical_device_point(self.cursor_pos)
-        cursor_offset_x = cursor_device.x() - source_rect.x()
-        cursor_offset_y = cursor_device.y() - source_rect.y()
-        target_x = max(0, min(target_width - snippet.width(), (target_width // 2) - cursor_offset_x))
-        target_y = max(0, min(target_height - snippet.height(), (target_height // 2) - cursor_offset_y))
-        painter_img = QPainter(padded)
-        painter_img.drawPixmap(target_x, target_y, snippet)
-        painter_img.end()
-
+        # 准备缩放
         zoom = 5
         dest_size = QSize(size.width() * zoom, size.height() * zoom)
-        magnified = QPixmap.fromImage(padded).scaled(
+        magnified = snippet.scaled(
             dest_size, Qt.KeepAspectRatio, Qt.FastTransformation
         )
 
+        # 计算放大镜显示位置（逻辑坐标）
         margin = 20
         dest_top_left = QPoint(self.cursor_pos.x() + margin, self.cursor_pos.y() + margin)
         if dest_top_left.x() + dest_size.width() > self.width():
@@ -5094,12 +5753,14 @@ class CaptureOverlay(QWidget):
             dest_top_left.setY(self.cursor_pos.y() - margin - dest_size.height())
         dest_rect = QRect(dest_top_left, dest_size)
 
+        # 绘制放大镜外框和图像
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.fillRect(dest_rect.adjusted(-4, -4, 4, 4), QColor(0, 0, 0, 180))
         painter.drawPixmap(dest_rect, magnified)
         painter.setPen(QPen(QColor(255, 255, 255), 2))
         painter.drawRect(dest_rect)
 
+        # 绘制十字线
         center_x = dest_rect.center().x()
         center_y = dest_rect.center().y()
         painter.setPen(QPen(QColor(255, 100, 100), 1, Qt.DashLine))
@@ -5111,12 +5772,13 @@ class CaptureOverlay(QWidget):
         return self._clamp_to_pixmap(rect)
 
     def _logical_device_rect(self, logical_rect: QRect):
-        if logical_rect is None:
+        if logical_rect is None or not logical_rect.isValid():
             return QRect()
+        # 使用 float 进行精确乘法，然后再四舍五入到物理像素
         x = int(round(logical_rect.x() * self._scale_x))
         y = int(round(logical_rect.y() * self._scale_y))
-        w = max(1, int(round(logical_rect.width() * self._scale_x)))
-        h = max(1, int(round(logical_rect.height() * self._scale_y)))
+        w = int(round(logical_rect.width() * self._scale_x))
+        h = int(round(logical_rect.height() * self._scale_y))
         return QRect(x, y, w, h)
 
     def _logical_device_point(self, logical_point: QPoint):
@@ -5195,9 +5857,13 @@ class ScreenSnapApp(QMainWindow):
             zoom_changed_callback=self._on_workspace_zoom_changed,
         )
         self._hotkey_manager = GlobalHotkeyManager(self)
+        app = QApplication.instance()
+        if app:
+            app.applicationStateChanged.connect(self._on_app_state_changed)
         self._last_selection_rect = None
         self._save_dir = (self.config.get("save_dir") or "").strip()
         self._force_exit_once = False
+        self._exiting = False
         self._pending_capture_handler = None
 
         main_widget = QWidget()
@@ -5301,11 +5967,26 @@ class ScreenSnapApp(QMainWindow):
         self.translation_panel.set_ai_settings(self.ai_settings)
 
     def _switch_page(self, key):
+        # region agent log
+        # H7: 页面是否被意外切换到 AI（用户感觉在自动 OCR）
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:ScreenSnapApp._switch_page",
+            message="switch page",
+            data={"key": key},
+        )
+        # endregion
         if key not in self._pages:
             return
         self.pages.setCurrentWidget(self._pages[key])
         self._current_page = key
         self._update_nav_state()
+        if key == "edit" and hasattr(self, "workspace_page"):
+            self.workspace_page.restore_last_active_tab()
+
+    def _on_app_state_changed(self, state):
+        if state == Qt.ApplicationActive and hasattr(self, "workspace_page"):
+            self.workspace_page.restore_last_active_tab()
 
     def _update_nav_state(self):
         for key, action in self.nav_actions.items():
@@ -5376,6 +6057,7 @@ class ScreenSnapApp(QMainWindow):
 
     def _trigger_exit_action(self):
         self._force_exit_once = True
+        logging.info("Exit action triggered from nav toolbar")
         self.close()
 
     def _prepare_save_dir(self):
@@ -5426,42 +6108,120 @@ class ScreenSnapApp(QMainWindow):
 
     def _start_capture_session(self, handler):
         self._pending_capture_handler = handler
-        self.hide()
-        QTimer.singleShot(200, self._start_overlay_capture)
+        
+        # 检查主窗口是否可见且未最小化
+        was_visible = self.isVisible() and not self.isMinimized()
+        if was_visible:
+            self.hide()
+            # 如果窗口原本可见，给系统 150ms 时间完成隐藏，避免截图中出现主窗口残影
+            delay = 150
+        else:
+            # 如果已经在托盘或最小化，可以认为“瞬间”触发
+            delay = 0
+
+        logging.info("Start capture session; was_visible=%s, delay=%dms, handler=%s", 
+                     was_visible, delay, handler.__name__ if hasattr(handler, "__name__") else str(handler))
+        
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:ScreenSnapApp._start_capture_session",
+            message="start capture session",
+            data={
+                "was_visible": was_visible,
+                "delay": delay,
+                "handler": handler.__name__ if hasattr(handler, "__name__") else str(handler)
+            },
+        )
+        # endregion
+
+        if delay > 0:
+            QTimer.singleShot(delay, self._start_overlay_capture)
+        else:
+            # 瞬间触发模式：直接截屏，不再等待事件处理，确保抓取最准确的瞬间
+            self._start_overlay_capture()
 
     def initiate_capture(self):
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:ScreenSnapApp.initiate_capture",
+            message="initiate_capture called",
+            data={},
+        )
+        # endregion
         save_dir = self._prepare_save_dir()
         if not save_dir:
             return
+        logging.info("Hotkey capture triggered")
         self._start_capture_session(self._handle_annotation_capture)
 
     def start_ai_translation_capture(self):
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:ScreenSnapApp.start_ai_translation_capture",
+            message="start_ai_translation_capture called",
+            data={},
+        )
+        # endregion
         if not self._ensure_ai_ready():
             return
         save_dir = self._prepare_save_dir()
         if not save_dir:
             return
+        logging.info("AI capture triggered")
         self._start_capture_session(self._handle_ai_translation_capture)
 
     def _start_overlay_capture(self):
         screens = QGuiApplication.screens()
         if not screens:
-            QMessageBox.critical(self, "错误", "未找到可用的屏幕设备，无法截图。")
-            self.show()
+            _show_message_box("错误", "未找到可用的屏幕设备，无法截图。", parent=self, critical=True)
+            self._show_main_window()
             return
+        
+        logging.info("Overlay capture start; screens=%d", len(screens))
         self._clear_overlays()
+        
+        # 1. 立即捕获所有屏幕的 Pixmap
+        # 这一步必须最先执行，且尽可能连续，以达到“全屏瞬间锁定”的效果
+        screen_data = []
         for screen in screens:
-            self._create_overlay_for_screen(screen)
+            try:
+                pix = self._grab_screen_pixmap(screen)
+                screen_data.append((screen, pix))
+            except Exception as e:
+                logging.error("Failed to grab screen %s: %s", screen.name(), e)
+
+        if not screen_data:
+            _show_message_box("错误", "屏幕画面捕获失败。", parent=self, critical=True)
+            self._show_main_window()
+            return
+
+        # 2. 创建并显示遮罩层
+        for screen, pixmap in screen_data:
+            overlay = CaptureOverlay(pixmap, screen.geometry().topLeft(), screen)
+            overlay.selectionMade.connect(self._on_overlay_selection)
+            overlay.canceled.connect(self._on_capture_cancel)
+            overlay.show()
+            self._active_overlays.append(overlay)
 
     def _on_capture_cancel(self):
         self._clear_overlays()
         self._pending_capture_handler = None
         self._show_main_window()
+        logging.info("Capture canceled")
 
     def _on_overlay_selection(self, pixmap: QPixmap, selection_rect: QRect, screen_name: str):
         self._clear_overlays()
         handler = self._pending_capture_handler or self._handle_annotation_capture
         self._pending_capture_handler = None
+        logging.info(
+            "Overlay selection made; rect=%s, screen=%s, handler=%s",
+            selection_rect,
+            screen_name,
+            handler.__name__ if hasattr(handler, "__name__") else str(handler),
+        )
         handler(pixmap, selection_rect, screen_name)
 
     def _handle_annotation_capture(self, pixmap: QPixmap, selection_rect: QRect, screen_name: str):
@@ -5471,15 +6231,38 @@ class ScreenSnapApp(QMainWindow):
         self.home_page.set_repeat_enabled(True)
         self._focus_workspace()
         self._resize_for_image(pixmap.size())
-        QApplication.clipboard().setPixmap(pixmap)
+        _set_clipboard_pixmap_with_retry(pixmap)
+        # region agent log
+        # H4: “区域截图后直接 Ctrl+V”走 setPixmap，记录以对照 PPT 报错概率
+        _agent_debug_log(
+            hypothesisId="H4",
+            location="screenshot_tool.py:ScreenSnapApp._handle_annotation_capture",
+            message="annotation_capture wrote clipboard via setPixmap",
+            data={"size": (pixmap.width(), pixmap.height()) if pixmap else None, "screen": screen_name},
+        )
+        # endregion
+        logging.info("Annotation capture handled; size=%s", pixmap.size())
 
     def _handle_ai_translation_capture(self, pixmap: QPixmap, selection_rect: QRect, screen_name: str):
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:ScreenSnapApp._handle_ai_translation_capture",
+            message="handle_ai_translation_capture",
+            data={
+                "screen": screen_name,
+                "rect": str(selection_rect),
+                "pixmap_size": (pixmap.width(), pixmap.height()) if pixmap else None,
+            },
+        )
+        # endregion
         self._last_selection_rect = QRect(selection_rect)
         self._last_capture_screen_name = screen_name
         self.home_page.set_repeat_enabled(True)
         self._switch_page("ai")
         self._show_main_window()
         self.translation_panel.add_capture(pixmap)
+        logging.info("AI capture handled; size=%s", pixmap.size())
 
     def _hotkey_display_text(self, action_id):
         hotkey_info = self.config.get("hotkeys", {}).get(action_id, {})
@@ -5621,6 +6404,14 @@ class ScreenSnapApp(QMainWindow):
         self._hotkey_manager.unregister_all()
 
     def _trigger_hotkey_action(self, action_id):
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:ScreenSnapApp._trigger_hotkey_action",
+            message="trigger hotkey action",
+            data={"action_id": action_id},
+        )
+        # endregion
         if action_id == "capture":
             self.initiate_capture()
         elif action_id == "repeat_capture":
@@ -5631,14 +6422,30 @@ class ScreenSnapApp(QMainWindow):
     def _on_hotkey_trigger(self, action_id):
         if self._active_overlays:
             return
+        logging.info("Hotkey fired: %s", action_id)
+        # region agent log
+        _agent_debug_log(
+            hypothesisId="H7",
+            location="screenshot_tool.py:ScreenSnapApp._on_hotkey_trigger",
+            message="hotkey fired",
+            data={"action_id": action_id},
+        )
+        # endregion
         QTimer.singleShot(0, lambda: self._trigger_hotkey_action(action_id))
 
     def nativeEvent(self, eventType, message):
         if eventType in ("windows_generic_MSG", "windows_dispatcher_MSG"):
-            msg = wintypes.MSG.from_address(message.__int__())
-            if msg.message == WM_HOTKEY:
-                self._hotkey_manager.handle_message(msg.wParam)
-                return True, 0
+            try:
+                msg = wintypes.MSG.from_address(message.__int__())
+                if msg.message == WM_HOTKEY:
+                    self._hotkey_manager.handle_message(msg.wParam)
+                    return True, 0
+            except KeyboardInterrupt:
+                logging.warning("KeyboardInterrupt received inside nativeEvent; quitting")
+                QTimer.singleShot(0, self.close)
+                return False, 0
+            except Exception as exc:
+                logging.error("nativeEvent error: %s", exc, exc_info=True)
         return super().nativeEvent(eventType, message)
 
     def _repeat_capture(self):
@@ -5646,6 +6453,7 @@ class ScreenSnapApp(QMainWindow):
             QMessageBox.information(self, "重复截图", "请先进行一次截图，随后才能使用重复截图功能。")
             return
         self.hide()
+        logging.info("Repeat capture triggered")
         QTimer.singleShot(200, self._do_repeat_capture)
 
     def _do_repeat_capture(self):
@@ -5665,9 +6473,22 @@ class ScreenSnapApp(QMainWindow):
         self.workspace_page.add_capture(cropped, self._resolved_save_dir(), self.workspace_zoom)
         self._focus_workspace()
         self._resize_for_image(cropped.size())
-        QApplication.clipboard().setPixmap(cropped)
+        _set_clipboard_pixmap_with_retry(cropped)
+        # region agent log
+        # H4: “重复截图后直接 Ctrl+V”走 setPixmap，记录路径以区分 MIME 写法 vs Pixmap 写法
+        _agent_debug_log(
+            hypothesisId="H4",
+            location="screenshot_tool.py:ScreenSnapApp._do_repeat_capture",
+            message="repeat_capture wrote clipboard via setPixmap",
+            data={"size": (cropped.width(), cropped.height()) if cropped else None},
+        )
+        # endregion
+        logging.info("Repeat capture done; size=%s", cropped.size())
 
     def closeEvent(self, event):
+        if self._exiting:
+            event.accept()
+            return
         behavior = self.close_behavior
         tray_available = bool(self.tray_icon and QSystemTrayIcon.isSystemTrayAvailable())
         if behavior == "tray" and not tray_available:
@@ -5676,18 +6497,31 @@ class ScreenSnapApp(QMainWindow):
             behavior = "exit"
         if getattr(self, "_force_exit_once", False):
             behavior = "exit"
+        logging.info(
+            "closeEvent fired; behavior=%s tray_available=%s closing_via_tray=%s force_exit=%s dirty_tabs=%s",
+            behavior,
+            tray_available,
+            getattr(self, "_closing_via_tray_exit", False),
+            getattr(self, "_force_exit_once", False),
+            len(self.workspace_page.get_dirty_tabs()) if hasattr(self, "workspace_page") else "n/a",
+        )
         if behavior == "tray":
             event.ignore()
             self._minimize_to_tray()
             return
         if not self._handle_unsaved_before_exit():
             event.ignore()
+            logging.info("closeEvent canceled by unsaved prompt")
             self._closing_via_tray_exit = False
             self._force_exit_once = False
             return
         self._cleanup_before_exit()
         self._closing_via_tray_exit = False
         self._force_exit_once = False
+        if behavior == "exit":
+            self._exiting = True
+            QTimer.singleShot(0, QApplication.instance().quit)
+        logging.info("closeEvent accepted, app will quit")
         super().closeEvent(event)
 
     def _handle_unsaved_before_exit(self):
@@ -5753,6 +6587,7 @@ class ScreenSnapApp(QMainWindow):
             self.tray_icon.showMessage("CTK Snapshot", "程序已最小化到系统托盘", QSystemTrayIcon.Information, 3000)
             self._tray_message_shown = True
         self.hide()
+        logging.info("Window minimized to tray")
 
     def _restore_from_tray(self):
         if self.tray_icon:
@@ -5769,6 +6604,7 @@ class ScreenSnapApp(QMainWindow):
         self._closing_via_tray_exit = True
         if self.tray_icon:
             self.tray_icon.hide()
+        logging.info("Exit triggered from tray menu")
         self.close()
 
     def _cleanup_before_exit(self):
@@ -5777,6 +6613,7 @@ class ScreenSnapApp(QMainWindow):
         if self.tray_icon:
             self.tray_icon.hide()
         self.tray_icon = None
+        logging.info("Cleanup before exit completed")
 
     def _sync_autostart_entry(self):
         command = self._autostart_command()
@@ -5804,14 +6641,6 @@ class ScreenSnapApp(QMainWindow):
         exe_path = sys.executable
         script_path = os.path.abspath(sys.argv[0])
         return f"\"{exe_path}\" \"{script_path}\" --minimized"
-
-    def _create_overlay_for_screen(self, screen):
-        screenshot = self._grab_screen_pixmap(screen)
-        overlay = CaptureOverlay(screenshot, screen.geometry().topLeft(), screen)
-        overlay.selectionMade.connect(self._on_overlay_selection)
-        overlay.canceled.connect(self._on_capture_cancel)
-        overlay.show()
-        self._active_overlays.append(overlay)
 
     def _clear_overlays(self):
         while self._active_overlays:
@@ -5885,6 +6714,8 @@ class ScreenSnapApp(QMainWindow):
 
 
 def main():
+    _setup_logging()
+    logging.info("Starting Snapshot app with args: %s", sys.argv)
     _ensure_qt_plugins_path()
     guard = SingleInstanceGuard()
     if guard.already_running:
@@ -5902,6 +6733,17 @@ def main():
             qt_args.append(arg)
     sys.argv = qt_args
     app = QApplication(qt_args)
+    logging.info("QApplication created")
+    try:
+        app.aboutToQuit.connect(lambda: logging.info("aboutToQuit emitted"))
+        app.lastWindowClosed.connect(lambda: logging.info("lastWindowClosed emitted"))
+    except Exception:
+        pass
+    try:
+        app.setQuitOnLastWindowClosed(False)
+        logging.info("Set quitOnLastWindowClosed=False to keep app alive when overlays close")
+    except Exception as exc:
+        logging.warning("Failed to set quitOnLastWindowClosed: %s", exc)
     if _USER_DATA_ERROR:
         _show_message_box(
             "存储目录受限",
@@ -5915,8 +6757,22 @@ def main():
     if not start_minimized:
         window.show()
     try:
-        sys.exit(app.exec_())
+        logging.info("Entering Qt event loop")
+        exit_code = 0
+        try:
+            exit_code = app.exec_()
+            logging.info("Event loop exited code=%s", exit_code)
+        except KeyboardInterrupt:
+            logging.warning("KeyboardInterrupt received; quitting app")
+            try:
+                app.quit()
+                QApplication.processEvents()
+            except Exception:
+                pass
+            exit_code = 1
+        sys.exit(exit_code)
     finally:
+        logging.info("Releasing single instance mutex")
         guard.release()
 
 
