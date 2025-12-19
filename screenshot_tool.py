@@ -4,6 +4,7 @@ from ctypes import wintypes
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -65,6 +66,7 @@ from PyQt5.QtCore import (
     QRect,
     QPointF,
     QRectF,
+    QLineF,
     Qt,
     pyqtSignal,
     QTimer,
@@ -95,7 +97,7 @@ from PyQt5.QtGui import (
     QDesktopServices,
     QKeySequence,
     QCursor,
-    QImage,
+    QPolygonF,
 )
 from PyQt5.QtWidgets import (
     QAction,
@@ -922,6 +924,8 @@ class Tool(Enum):
     SELECTION = auto()
     CROP = auto()
     IMAGE = auto()
+    LINE = auto()
+    ARROW = auto()
 
 MODIFIER_ORDER = [
     (Qt.ControlModifier, "Ctrl"),
@@ -2075,6 +2079,16 @@ class AnnotationCanvas(QWidget):
         self.marker_size = DEFAULT_MARKER_STYLE["size"]
         self.marker_font_ratio = DEFAULT_MARKER_STYLE["font_ratio"]
         self.next_marker_number = DEFAULT_MARKER_STYLE.get("next_number", 1)
+        self.lines = []
+        self.arrows = []
+        self.selected_line_index = None
+        self.selected_arrow_index = None
+        self._shape_drag_mode = None
+        self._shape_drag_handle = None
+        self._shape_drag_origin = None
+        self._shape_initial_data = None
+        self._current_shape = None  # 用于拖拽创建中的形状
+        
         self.dragging_marker_index = None
         self.selected_marker_index = None
         self.hover_marker_index = None
@@ -2083,8 +2097,11 @@ class AnnotationCanvas(QWidget):
         self.rectangle_border_color = QColor(DEFAULT_RECT_STYLE["border"])
         self.rectangle_border_enabled = DEFAULT_RECT_STYLE["border_enabled"]
         self.rectangle_border_width = DEFAULT_RECT_STYLE["width"]
-        self.rectangle_corner_radius = DEFAULT_RECT_STYLE["radius"]
         self.rectangles_flattened = True
+        self.line_color = QColor("#5f27cd")
+        self.line_width = 3
+        self.arrow_color = QColor("#ff4757")
+        self.arrow_width = 3
         
         # 图片边框设置
         self.image_border_color = QColor(DEFAULT_IMAGE_BORDER_STYLE["color"])
@@ -2221,6 +2238,8 @@ class AnnotationCanvas(QWidget):
         self._push_undo_state()
         self.rectangles.clear()
         self.markers.clear()
+        self.lines.clear()
+        self.arrows.clear()
         self.next_marker_number = 1
         self.markers_flattened = True
         self.rectangles_flattened = True
@@ -2411,6 +2430,28 @@ class AnnotationCanvas(QWidget):
             return self.duplicate_rectangle()
         if kind == "marker":
             return self.duplicate_marker()
+        if kind == "line":
+            if self.selected_line_index is not None and self.selected_line_index < len(self.lines):
+                self._push_undo_state()
+                info = self._clone_line(self.lines[self.selected_line_index])
+                info['start'] += QPoint(15, 15)
+                info['end'] += QPoint(15, 15)
+                self.lines.append(info)
+                self.selected_line_index = len(self.lines) - 1
+                self.update()
+                self.optionsUpdated.emit()
+                return True
+        if kind == "arrow":
+            if self.selected_arrow_index is not None and self.selected_arrow_index < len(self.arrows):
+                self._push_undo_state()
+                info = self._clone_arrow(self.arrows[self.selected_arrow_index])
+                info['start'] += QPoint(15, 15)
+                info['end'] += QPoint(15, 15)
+                self.arrows.append(info)
+                self.selected_arrow_index = len(self.arrows) - 1
+                self.update()
+                self.optionsUpdated.emit()
+                return True
         return False
 
     def apply_style_defaults(self, marker_style, rect_style, text_style=None, image_border_style=None):
@@ -2549,6 +2590,40 @@ class AnnotationCanvas(QWidget):
         self.optionsUpdated.emit()
         self.update()
 
+    def update_selected_shape_color(self, color: QColor):
+        if not color or not color.isValid():
+            return
+        # 只有在有选中形状时才更新并推送 undo
+        has_selection = (self.selected_line_index is not None or 
+                         self.selected_arrow_index is not None)
+        if not has_selection:
+            return
+            
+        self._push_undo_state()
+        if self.selected_line_index is not None:
+            self.lines[self.selected_line_index]['color'] = QColor(color)
+            self.line_color = QColor(color)
+        elif self.selected_arrow_index is not None:
+            self.arrows[self.selected_arrow_index]['color'] = QColor(color)
+            self.arrow_color = QColor(color)
+        self.optionsUpdated.emit()
+        self.update()
+
+    def update_selected_shape_width(self, width: int):
+        has_selection = (self.selected_line_index is not None or 
+                         self.selected_arrow_index is not None)
+        if not has_selection:
+            return
+        self._push_undo_state()
+        if self.selected_line_index is not None:
+            self.lines[self.selected_line_index]['width'] = width
+            self.line_width = width
+        elif self.selected_arrow_index is not None:
+            self.arrows[self.selected_arrow_index]['width'] = width
+            self.arrow_width = width
+        self.optionsUpdated.emit()
+        self.update()
+
     def update_selected_text_background(self, color: QColor):
         if not color or not color.isValid() or not self._has_active_text():
             return
@@ -2604,6 +2679,14 @@ class AnnotationCanvas(QWidget):
             return "marker"
         if self._has_active_rectangle():
             return "rectangle"
+        if self.selected_line_index is not None:
+            return "line"
+        if self.selected_arrow_index is not None:
+            return "arrow"
+        if self.tool == Tool.LINE:
+            return "line"
+        if self.tool == Tool.ARROW:
+            return "arrow"
         return "none"
 
     def clear_active_selection(self, emit=True):
@@ -2637,6 +2720,15 @@ class AnnotationCanvas(QWidget):
         if self.hover_marker_index is not None:
             self._set_hover_marker(None)
             changed = True
+        
+        # 清除图形选中状态
+        if self.selected_line_index is not None:
+            self.selected_line_index = None
+            changed = True
+        if self.selected_arrow_index is not None:
+            self.selected_arrow_index = None
+            changed = True
+            
         if changed:
             self._update_default_cursor()
             if emit:
@@ -2762,6 +2854,22 @@ class AnnotationCanvas(QWidget):
             "font_size": item.get("font_size", self.text_font_size),
         }
 
+    def _clone_line(self, line):
+        return {
+            "start": QPoint(line["start"]),
+            "end": QPoint(line["end"]),
+            "color": QColor(line["color"]),
+            "width": line["width"],
+        }
+
+    def _clone_arrow(self, arrow):
+        return {
+            "start": QPoint(arrow["start"]),
+            "end": QPoint(arrow["end"]),
+            "color": QColor(arrow["color"]),
+            "width": arrow["width"],
+        }
+
     def _snapshot_state(self):
         try:
             base_snapshot = self.base_pixmap.copy()
@@ -2771,6 +2879,8 @@ class AnnotationCanvas(QWidget):
             "base_pixmap": base_snapshot,
             "markers": [self._clone_marker(m) for m in self.markers],
             "rectangles": [self._clone_rectangle(r) for r in self.rectangles],
+            "lines": [self._clone_line(l) for l in self.lines],
+            "arrows": [self._clone_arrow(a) for a in self.arrows],
             "text_items": [self._clone_text_item(t) for t in self.text_items],
             "selection_rect": QRect(self.selection_rect) if self.selection_rect else None,
             "markers_flattened": self.markers_flattened,
@@ -2778,6 +2888,8 @@ class AnnotationCanvas(QWidget):
             "selected_marker_index": self.selected_marker_index,
             "selected_rectangle_index": self.selected_rectangle_index,
             "selected_text_index": self.selected_text_index,
+            "selected_line_index": self.selected_line_index,
+            "selected_arrow_index": self.selected_arrow_index,
             "next_marker_number": self.next_marker_number,
             "marker_style": {
                 "fill": QColor(self.marker_fill_color),
@@ -2826,6 +2938,8 @@ class AnnotationCanvas(QWidget):
         self.base_pixmap = state["base_pixmap"].copy()
         self.markers = [self._clone_marker(m) for m in state.get("markers", [])]
         self.rectangles = [self._clone_rectangle(r) for r in state.get("rectangles", [])]
+        self.lines = [self._clone_line(l) for l in state.get("lines", [])]
+        self.arrows = [self._clone_arrow(a) for a in state.get("arrows", [])]
         self.text_items = [self._clone_text_item(t) for t in state.get("text_items", [])]
         snap_rect = state.get("selection_rect")
         self.selection_rect = QRect(snap_rect) if snap_rect else None
@@ -2834,6 +2948,22 @@ class AnnotationCanvas(QWidget):
         self.selected_marker_index = state.get("selected_marker_index")
         self.selected_rectangle_index = state.get("selected_rectangle_index")
         self.selected_text_index = state.get("selected_text_index")
+        
+        # 验证选中的索引是否仍然有效
+        if self.selected_marker_index is not None and (self.selected_marker_index < 0 or self.selected_marker_index >= len(self.markers)):
+            self.selected_marker_index = None
+        if self.selected_rectangle_index is not None and (self.selected_rectangle_index < 0 or self.selected_rectangle_index >= len(self.rectangles)):
+            self.selected_rectangle_index = None
+        if self.selected_text_index is not None and (self.selected_text_index < 0 or self.selected_text_index >= len(self.text_items)):
+            self.selected_text_index = None
+            
+        self.selected_line_index = state.get("selected_line_index")
+        if self.selected_line_index is not None and (self.selected_line_index < 0 or self.selected_line_index >= len(self.lines)):
+            self.selected_line_index = None
+            
+        self.selected_arrow_index = state.get("selected_arrow_index")
+        if self.selected_arrow_index is not None and (self.selected_arrow_index < 0 or self.selected_arrow_index >= len(self.arrows)):
+            self.selected_arrow_index = None
         self.next_marker_number = state.get("next_marker_number", self.next_marker_number)
         marker_style = state.get("marker_style", {})
         self.marker_fill_color = QColor(marker_style.get("fill", self.marker_fill_color))
@@ -2959,6 +3089,20 @@ class AnnotationCanvas(QWidget):
             self.update()
             self.optionsUpdated.emit()
             self._update_default_cursor()
+            return True
+        if self.selected_line_index is not None:
+            self._push_undo_state()
+            self.lines.pop(self.selected_line_index)
+            self.selected_line_index = None
+            self.update()
+            self.optionsUpdated.emit()
+            return True
+        if self.selected_arrow_index is not None:
+            self._push_undo_state()
+            self.arrows.pop(self.selected_arrow_index)
+            self.selected_arrow_index = None
+            self.update()
+            self.optionsUpdated.emit()
             return True
         return False
 
@@ -3116,13 +3260,28 @@ class AnnotationCanvas(QWidget):
             self._text_dragging = False
             self.update()
             return
+        if self.tool == Tool.MARKER:
+            if self._handle_marker_press(pos, allow_creation=True):
+                return
+        elif self.tool == Tool.RECTANGLE:
+            if self._handle_rect_press(pos, allow_creation=True):
+                return
+        elif self.tool == Tool.TEXT:
+            if self._handle_text_press(pos, allow_creation=True):
+                return
+        elif self.tool in (Tool.LINE, Tool.ARROW):
+            if self._handle_shape_press(pos, allow_creation=True):
+                return
+        
         if self._handle_rect_press(pos, allow_creation=False, handles_only=True):
             return
-        if self._handle_text_press(pos, allow_creation=self.tool == Tool.TEXT):
+        if self._handle_text_press(pos, allow_creation=False):
             return
-        if self._handle_marker_press(pos, allow_creation=self.tool == Tool.MARKER):
+        if self._handle_marker_press(pos, allow_creation=False):
             return
-        if self._handle_rect_press(pos, allow_creation=self.tool == Tool.RECTANGLE):
+        if self._handle_rect_press(pos, allow_creation=False):
+            return
+        if self._handle_shape_press(pos, allow_creation=False):
             return
         self.clear_active_selection()
 
@@ -3145,6 +3304,86 @@ class AnnotationCanvas(QWidget):
                 },
             )
         # endregion
+        
+        if self._current_shape:
+            if self._current_shape['type'] in ('line', 'arrow'):
+                end_pos = pos
+                if event.modifiers() & Qt.ShiftModifier:
+                    # Shift 按下时，吸附到 45 度角
+                    start = self._current_shape['start']
+                    dx = pos.x() - start.x()
+                    dy = pos.y() - start.y()
+                    angle = math.atan2(dy, dx)
+                    # 将弧度转换为 45 度的倍数
+                    # 45 deg = pi/4 rad
+                    snapped_angle = round(angle / (math.pi / 4)) * (math.pi / 4)
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    end_pos = QPoint(
+                        int(round(start.x() + dist * math.cos(snapped_angle))),
+                        int(round(start.y() + dist * math.sin(snapped_angle)))
+                    )
+                self._current_shape['end'] = end_pos
+            self.update()
+            return
+
+        # 处理形状移动/缩放
+        if self._shape_drag_mode == 'move':
+            delta = pos - self._shape_drag_origin
+            if self.selected_line_index is not None and self.selected_line_index < len(self.lines):
+                info = self.lines[self.selected_line_index]
+                info['start'] = self._shape_initial_data['start'] + delta
+                info['end'] = self._shape_initial_data['end'] + delta
+            elif self.selected_arrow_index is not None and self.selected_arrow_index < len(self.arrows):
+                info = self.arrows[self.selected_arrow_index]
+                info['start'] = self._shape_initial_data['start'] + delta
+                info['end'] = self._shape_initial_data['end'] + delta
+            self.update()
+            return
+        elif self._shape_drag_mode == 'resize':
+            if self.selected_line_index is not None and self.selected_line_index < len(self.lines):
+                info = self.lines[self.selected_line_index]
+                if self._shape_drag_handle == 'start':
+                    new_start = pos
+                    if event.modifiers() & Qt.ShiftModifier:
+                        # 吸附
+                        dx = pos.x() - info['end'].x()
+                        dy = pos.y() - info['end'].y()
+                        angle = round(math.atan2(dy, dx) / (math.pi / 4)) * (math.pi / 4)
+                        dist = math.sqrt(dx*dx + dy*dy)
+                        new_start = info['end'] + QPoint(int(round(dist * math.cos(angle))), int(round(dist * math.sin(angle))))
+                    info['start'] = new_start
+                else:
+                    new_end = pos
+                    if event.modifiers() & Qt.ShiftModifier:
+                        dx = pos.x() - info['start'].x()
+                        dy = pos.y() - info['start'].y()
+                        angle = round(math.atan2(dy, dx) / (math.pi / 4)) * (math.pi / 4)
+                        dist = math.sqrt(dx*dx + dy*dy)
+                        new_end = info['start'] + QPoint(int(round(dist * math.cos(angle))), int(round(dist * math.sin(angle))))
+                    info['end'] = new_end
+            elif self.selected_arrow_index is not None and self.selected_arrow_index < len(self.arrows):
+                info = self.arrows[self.selected_arrow_index]
+                if self._shape_drag_handle == 'start':
+                    new_start = pos
+                    if event.modifiers() & Qt.ShiftModifier:
+                        dx = pos.x() - info['end'].x()
+                        dy = pos.y() - info['end'].y()
+                        angle = round(math.atan2(dy, dx) / (math.pi / 4)) * (math.pi / 4)
+                        dist = math.sqrt(dx*dx + dy*dy)
+                        new_start = info['end'] + QPoint(int(round(dist * math.cos(angle))), int(round(dist * math.sin(angle))))
+                    info['start'] = new_start
+                else:
+                    new_end = pos
+                    if event.modifiers() & Qt.ShiftModifier:
+                        dx = pos.x() - info['start'].x()
+                        dy = pos.y() - info['start'].y()
+                        angle = round(math.atan2(dy, dx) / (math.pi / 4)) * (math.pi / 4)
+                        dist = math.sqrt(dx*dx + dy*dy)
+                        new_end = info['start'] + QPoint(int(round(dist * math.cos(angle))), int(round(dist * math.sin(angle))))
+                    info['end'] = new_end
+            self.update()
+            return
+
         if (self.tool == Tool.SELECTION or self.tool == Tool.CROP) and self._selection_origin is not None:
             bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
             if self._selection_drag_mode == "move" and self.selection_rect:
@@ -3215,6 +3454,29 @@ class AnnotationCanvas(QWidget):
         is_crop_mode = (self.tool == Tool.CROP)
         is_dragging = self._selection_dragging
         
+        if self._current_shape:
+            # 完成形状创建
+            if self._current_shape['type'] == 'line':
+                self.lines.append(self._current_shape)
+                self.selected_line_index = len(self.lines) - 1
+            elif self._current_shape['type'] == 'arrow':
+                self.arrows.append(self._current_shape)
+                self.selected_arrow_index = len(self.arrows) - 1
+            self._current_shape = None
+            self._mark_backing_store_dirty()
+            self.optionsUpdated.emit()
+            self.update()
+            return
+
+        if self._shape_drag_mode:
+            self._shape_drag_mode = None
+            self._shape_drag_origin = None
+            self._shape_initial_data = None
+            self._mark_backing_store_dirty()
+            self.optionsUpdated.emit()
+            self.update()
+            return
+
         if (self.tool == Tool.SELECTION or self.tool == Tool.CROP) and self._selection_origin is not None:
             bounds = QRect(0, 0, self.base_pixmap.width(), self.base_pixmap.height())
             if self._selection_drag_mode == "move" and self.selection_rect:
@@ -3420,8 +3682,58 @@ class AnnotationCanvas(QWidget):
             view_pos = self.mapFromGlobal(QCursor.pos())
             self._update_pointer_feedback(self._view_to_scene(view_pos))
 
+    def _handle_shape_press(self, pos: QPoint, allow_creation=True):
+        # 0. 检查是否点击了已选中形状的控制柄
+        handle = self._shape_handle_hit_test(pos)
+        if handle:
+            self._push_undo_state()
+            self._shape_drag_mode = 'resize'
+            self._shape_drag_handle = handle
+            self._shape_drag_origin = pos
+            if self.selected_line_index is not None:
+                self._shape_initial_data = self._clone_line(self.lines[self.selected_line_index])
+            elif self.selected_arrow_index is not None:
+                self._shape_initial_data = self._clone_arrow(self.arrows[self.selected_arrow_index])
+            self.optionsUpdated.emit()
+            return True
+
+        # 1. 检查是否点击了已有的形状
+        line_idx = self._line_hit_test(pos)
+        if line_idx is not None:
+            self._push_undo_state()
+            self.selected_line_index = line_idx
+            self._shape_drag_mode = 'move'
+            self._shape_drag_origin = pos
+            self._shape_initial_data = self._clone_line(self.lines[line_idx])
+            self.update()
+            self.optionsUpdated.emit()
+            return True
+            
+        arrow_idx = self._arrow_hit_test(pos)
+        if arrow_idx is not None:
+            self._push_undo_state()
+            self.selected_arrow_index = arrow_idx
+            self._shape_drag_mode = 'move'
+            self._shape_drag_origin = pos
+            self._shape_initial_data = self._clone_arrow(self.arrows[arrow_idx])
+            self.update()
+            self.optionsUpdated.emit()
+            return True
+
+        if not allow_creation:
+            return False
+            
+        self._push_undo_state()
+        if self.tool == Tool.LINE:
+            self._current_shape = {'type': 'line', 'start': pos, 'end': pos, 'color': self.line_color, 'width': self.line_width}
+        elif self.tool == Tool.ARROW:
+            self._current_shape = {'type': 'arrow', 'start': pos, 'end': pos, 'color': self.arrow_color, 'width': self.arrow_width}
+            
+        self.update()
+        return True
+
     def _handle_rect_press(self, pos: QPoint, allow_creation=True, handles_only=False):
-        idx, handle = self._rect_handle_hit_test(pos)
+        idx, handle = self._handle_rect_handle_hit_test(pos)
         if idx is not None:
             self._push_undo_state()
             self.selected_rectangle_index = idx
@@ -3513,6 +3825,35 @@ class AnnotationCanvas(QWidget):
                 painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(info['rect'], info['radius'], info['radius'])
             
+        # 绘制所有直线
+        for idx, info in enumerate(self.lines):
+            painter.setPen(QPen(info['color'], info['width']))
+            painter.drawLine(info['start'], info['end'])
+            # 选中高亮
+            if idx == self.selected_line_index:
+                painter.setPen(QPen(QColor(30, 144, 255), 1, Qt.DashLine))
+                painter.drawRect(QRect(info['start'], info['end']).normalized().adjusted(-5, -5, 5, 5))
+                # 绘制端点控制柄
+                painter.setBrush(QColor("#ffffff"))
+                painter.setPen(QPen(QColor(30, 144, 255), 1))
+                r = 4
+                painter.drawEllipse(info['start'], r, r)
+                painter.drawEllipse(info['end'], r, r)
+            
+        # 绘制所有箭头
+        for idx, info in enumerate(self.arrows):
+            self._draw_arrow(painter, info['start'], info['end'], info['color'], info['width'])
+            # 选中高亮
+            if idx == self.selected_arrow_index:
+                painter.setPen(QPen(QColor(30, 144, 255), 1, Qt.DashLine))
+                painter.drawRect(QRect(info['start'], info['end']).normalized().adjusted(-10, -10, 10, 10))
+                # 绘制端点控制柄
+                painter.setBrush(QColor("#ffffff"))
+                painter.setPen(QPen(QColor(30, 144, 255), 1))
+                r = 4
+                painter.drawEllipse(info['start'], r, r)
+                painter.drawEllipse(info['end'], r, r)
+            
         # 绘制所有文字
         for idx, item in enumerate(self.text_items):
             bounding, text_font, _ = self._text_geometry(item)
@@ -3592,6 +3933,14 @@ class AnnotationCanvas(QWidget):
         if self._backing_store_dirty:
             self._render_to_backing_store()
         painter.drawPixmap(0, 0, self._backing_store)
+        
+        # 绘制当前正在创建的形状
+        if self._current_shape:
+            if self._current_shape['type'] == 'line':
+                painter.setPen(QPen(self._current_shape['color'], self._current_shape['width']))
+                painter.drawLine(self._current_shape['start'], self._current_shape['end'])
+            elif self._current_shape['type'] == 'arrow':
+                self._draw_arrow(painter, self._current_shape['start'], self._current_shape['end'], self._current_shape['color'], self._current_shape['width'])
         
         # 3. 绘制动态元素
         # 裁切模式提示（无选区时显示整体暗化和边框提示）
@@ -3676,6 +4025,21 @@ class AnnotationCanvas(QWidget):
             painter.setBrush(color)
             painter.drawEllipse(glow_rect)
 
+        # 绘制新图形的选中控制柄
+        painter.setBrush(QColor("#5f27cd"))
+        painter.setPen(QPen(Qt.white, 1))
+        handle_size = 8
+        half = handle_size // 2
+        
+        if self.selected_line_index is not None and self.selected_line_index < len(self.lines):
+            info = self.lines[self.selected_line_index]
+            for p in [info['start'], info['end']]:
+                painter.drawRect(p.x() - half, p.y() - half, handle_size, handle_size)
+        elif self.selected_arrow_index is not None and self.selected_arrow_index < len(self.arrows):
+            info = self.arrows[self.selected_arrow_index]
+            for p in [info['start'], info['end']]:
+                painter.drawRect(p.x() - half, p.y() - half, handle_size, handle_size)
+
         painter.restore()
 
     def export_pixmap(self):
@@ -3737,6 +4101,15 @@ class AnnotationCanvas(QWidget):
                 painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(info['rect'], info['radius'], info['radius'])
             
+        # 绘制所有直线
+        for info in self.lines:
+            painter.setPen(QPen(info['color'], info['width']))
+            painter.drawLine(info['start'], info['end'])
+            
+        # 绘制所有箭头
+        for info in self.arrows:
+            self._draw_arrow(painter, info['start'], info['end'], info['color'], info['width'])
+            
         # 绘制文字
         for idx, item in enumerate(self.text_items):
             text_color = item.get("color") or self.text_color
@@ -3783,6 +4156,18 @@ class AnnotationCanvas(QWidget):
             ellipse_rect = QRect(marker['pos'].x() - radius, marker['pos'].y() - radius, radius * 2, radius * 2)
             if ellipse_rect.contains(pos):
                 return idx
+        return None
+
+    def _shape_handle_hit_test(self, pos: QPoint):
+        r = 10
+        if self.selected_line_index is not None and self.selected_line_index < len(self.lines):
+            info = self.lines[self.selected_line_index]
+            if (pos - info['start']).manhattanLength() < r: return 'start'
+            if (pos - info['end']).manhattanLength() < r: return 'end'
+        if self.selected_arrow_index is not None and self.selected_arrow_index < len(self.arrows):
+            info = self.arrows[self.selected_arrow_index]
+            if (pos - info['start']).manhattanLength() < r: return 'start'
+            if (pos - info['end']).manhattanLength() < r: return 'end'
         return None
 
     def _text_hit_test(self, pos: QPoint):
@@ -3833,7 +4218,80 @@ class AnnotationCanvas(QWidget):
         self._checker_brush = QBrush(tile)
         return self._checker_brush
 
-    def _rect_handle_hit_test(self, pos: QPoint):
+    def _draw_arrow(self, painter, start, end, color, width):
+        painter.save()
+        painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.setBrush(color)
+        
+        # 绘制主干线
+        painter.drawLine(start, end)
+        
+        # 计算箭头
+        line = QLineF(start, end)
+        if line.length() < 1:
+            painter.restore()
+            return
+            
+        angle = math.atan2(-line.dy(), line.dx())
+        arrow_size = 15 + width * 2
+        arrow_angle = math.pi / 6
+        
+        p1 = end + QPointF(math.cos(angle + math.pi - arrow_angle) * arrow_size,
+                           -math.sin(angle + math.pi - arrow_angle) * arrow_size)
+        p2 = end + QPointF(math.cos(angle + math.pi + arrow_angle) * arrow_size,
+                           -math.sin(angle + math.pi + arrow_angle) * arrow_size)
+        
+        painter.drawPolygon(QPolygonF([end, p1, p2]))
+        painter.restore()
+
+    def _line_hit_test(self, pos: QPoint):
+        # 检查点击是否在某条直线上（容差 10 像素）
+        tolerance = 10
+        for idx in reversed(range(len(self.lines))):
+            info = self.lines[idx]
+            p1 = info['start']
+            p2 = info['end']
+            p3 = pos
+            
+            # 简单的距离计算：点到线段的距离
+            line_len_sq = (p2.x() - p1.x())**2 + (p2.y() - p1.y())**2
+            if line_len_sq == 0:
+                dist = math.sqrt((p3.x() - p1.x())**2 + (p3.y() - p1.y())**2)
+            else:
+                t = ((p3.x() - p1.x()) * (p2.x() - p1.x()) + (p3.y() - p1.y()) * (p2.y() - p1.y())) / line_len_sq
+                t = max(0, min(1, t))
+                proj_x = p1.x() + t * (p2.x() - p1.x())
+                proj_y = p1.y() + t * (p2.y() - p1.y())
+                dist = math.sqrt((p3.x() - proj_x)**2 + (p3.y() - proj_y)**2)
+            
+            if dist < tolerance:
+                return idx
+        return None
+
+    def _arrow_hit_test(self, pos: QPoint):
+        # 箭头也是基于直线逻辑
+        tolerance = 10
+        for idx in reversed(range(len(self.arrows))):
+            info = self.arrows[idx]
+            p1 = info['start']
+            p2 = info['end']
+            p3 = pos
+            
+            line_len_sq = (p2.x() - p1.x())**2 + (p2.y() - p1.y())**2
+            if line_len_sq == 0:
+                dist = math.sqrt((p3.x() - p1.x())**2 + (p3.y() - p1.y())**2)
+            else:
+                t = ((p3.x() - p1.x()) * (p2.x() - p1.x()) + (p3.y() - p1.y()) * (p2.y() - p1.y())) / line_len_sq
+                t = max(0, min(1, t))
+                proj_x = p1.x() + t * (p2.x() - p1.x())
+                proj_y = p1.y() + t * (p2.y() - p1.y())
+                dist = math.sqrt((p3.x() - proj_x)**2 + (p3.y() - proj_y)**2)
+            
+            if dist < tolerance:
+                return idx
+        return None
+
+    def _handle_rect_handle_hit_test(self, pos: QPoint):
         handles = ['top-left', 'top-right', 'bottom-left', 'bottom-right']
         for idx in reversed(range(len(self.rectangles))):
             info = self.rectangles[idx]
@@ -3927,7 +4385,7 @@ class AnnotationCanvas(QWidget):
             return
         allow_rect_cursor = self.tool != Tool.MARKER
         if allow_rect_cursor:
-            idx, handle = self._rect_handle_hit_test(pos)
+            idx, handle = self._handle_rect_handle_hit_test(pos)
             if idx is not None and handle:
                 self._set_hover_marker(None)
                 if handle in ("top-left", "bottom-right"):
@@ -4023,7 +4481,7 @@ class AnnotationCanvas(QWidget):
             self._update_cursor(Qt.CrossCursor)
         elif self.tool == Tool.TEXT:
             self._update_cursor(Qt.IBeamCursor)
-        elif self.tool == Tool.SELECTION or self.tool == Tool.CROP:
+        elif self.tool in (Tool.SELECTION, Tool.CROP, Tool.LINE, Tool.ARROW):
             self._update_cursor(Qt.CrossCursor)
         else:
             self._update_cursor(Qt.ArrowCursor)
@@ -4194,14 +4652,25 @@ class AnnotationTab(QWidget):
                 painter.drawLine(QPointF(sc(24), sc(22)), QPointF(sc(24), sc(30)))
                 painter.drawLine(QPointF(sc(28), sc(22)), QPointF(sc(28), sc(30)))
             elif kind == "duplicate":
+                # 克隆图标：两个叠加的小纸片
+                painter.setBrush(QColor(base_color))
+                painter.drawRoundedRect(rectf(12, 12, 18, 20), sc(4), sc(4))
+                painter.setBrush(QColor("#ffffff"))
+                painter.drawRoundedRect(rectf(18, 18, 18, 20), sc(4), sc(4))
+                painter.setPen(QPen(QColor(stroke_color), sc(2)))
+                painter.drawRoundedRect(rectf(18, 18, 18, 20), sc(4), sc(4))
+            elif kind == "line":
                 painter.setBrush(Qt.NoBrush)
-                painter.drawRoundedRect(rectf(12, 14, 18, 16), sc(5), sc(5))
-                painter.drawRoundedRect(rectf(18, 18, 18, 16), sc(5), sc(5))
-            elif kind == "flatten":
-                painter.setBrush(Qt.NoBrush)
-                painter.drawRoundedRect(rectf(12, 14, 24, 6), sc(3), sc(3))
-                painter.drawRoundedRect(rectf(12, 22, 24, 6), sc(3), sc(3))
-                painter.drawRoundedRect(rectf(12, 30, 24, 6), sc(3), sc(3))
+                painter.drawLine(QPointF(sc(12), sc(36)), QPointF(sc(36), sc(12)))
+            elif kind == "arrow":
+                painter.setBrush(QColor(stroke_color))
+                painter.drawLine(QPointF(sc(12), sc(36)), QPointF(sc(36), sc(12)))
+                # 绘制箭头小三角形
+                painter.drawPolygon(QPolygonF([
+                    QPointF(sc(36), sc(12)),
+                    QPointF(sc(36), sc(22)),
+                    QPointF(sc(26), sc(12))
+                ]))
             elif kind == "save":
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRoundedRect(rectf(14, 28, 20, 8), sc(3), sc(3))
@@ -4268,6 +4737,22 @@ class AnnotationTab(QWidget):
                 background: #f7b500;
                 color: #060606;
             }
+            QToolBar#AnnotationToolbar QToolButton#Tool_line {
+                background: rgba(95,39,205,0.12);
+                color: #5f27cd;
+            }
+            QToolBar#AnnotationToolbar QToolButton#Tool_line:checked {
+                background: #5f27cd;
+                color: #ffffff;
+            }
+            QToolBar#AnnotationToolbar QToolButton#Tool_arrow {
+                background: rgba(255,71,87,0.12);
+                color: #ff4757;
+            }
+            QToolBar#AnnotationToolbar QToolButton#Tool_arrow:checked {
+                background: #ff4757;
+                color: #ffffff;
+            }
             QToolBar#AnnotationToolbar QToolButton#Tool_crop {
                 background: rgba(185,28,28,0.18);
                 color: #991b1b;
@@ -4307,6 +4792,53 @@ class AnnotationTab(QWidget):
         text_button = toolbar.widgetForAction(text_action)
         if text_button:
             text_button.setObjectName("Tool_text")
+
+        # --- 图形下拉菜单 ---
+        shapes_button = QToolButton(self)
+        shapes_button.setText("图形")
+        shapes_button.setIcon(_make_tool_icon("line", "#e9ddff", "#5f27cd")) # 默认图标
+        shapes_button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        shapes_button.setPopupMode(QToolButton.InstantPopup)
+        shapes_button.setObjectName("Tool_shapes")
+        
+        shapes_menu = QMenu(shapes_button)
+        shapes_menu.setStyleSheet("""
+            QMenu {
+                background-color: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 8px 24px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #f1f5f9;
+                color: #0f172a;
+            }
+        """)
+
+        line_action = QAction("直线", self)
+        line_action.setIcon(_make_tool_icon("line", "#e9ddff", "#5f27cd"))
+        line_action.setCheckable(True)
+        line_action.triggered.connect(lambda: self._set_tool(Tool.LINE))
+        shapes_menu.addAction(line_action)
+
+        arrow_action = QAction("箭头", self)
+        arrow_action.setIcon(_make_tool_icon("arrow", "#ffe2e2", "#ff4757"))
+        arrow_action.setCheckable(True)
+        arrow_action.triggered.connect(lambda: self._set_tool(Tool.ARROW))
+        shapes_menu.addAction(arrow_action)
+
+        shapes_button.setMenu(shapes_menu)
+        toolbar.addWidget(shapes_button)
+
+        # 保持对这些 action 的引用以进行状态同步
+        self._shape_actions = {
+            Tool.LINE: line_action,
+            Tool.ARROW: arrow_action,
+        }
 
         select_action = QAction("选区", self)
         select_action.setIcon(_make_tool_icon("select", "#dbeafe", "#0ea5e9"))
@@ -4350,6 +4882,8 @@ class AnnotationTab(QWidget):
             Tool.RECTANGLE: rect_action,
             Tool.MARKER: marker_action,
             Tool.TEXT: text_action,
+            Tool.LINE: line_action,
+            Tool.ARROW: arrow_action,
             Tool.SELECTION: select_action,
             Tool.CROP: crop_action,
         }
@@ -4359,6 +4893,7 @@ class AnnotationTab(QWidget):
         self.marker_panel = MarkerOptionsPanel(self.canvas)
         self.rectangle_panel = RectangleOptionsPanel(self.canvas)
         self.text_panel = TextOptionsPanel(self)
+        self.shape_panel = ShapeOptionsPanel(self.canvas)
         self._options_placeholder = QWidget()
         self._options_placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -4369,6 +4904,7 @@ class AnnotationTab(QWidget):
         self.panel_stack.addWidget(self.marker_panel)
         self.panel_stack.addWidget(self.rectangle_panel)
         self.panel_stack.addWidget(self.text_panel)
+        self.panel_stack.addWidget(self.shape_panel)
         
         # 裁切选项面板（复用选区面板样式）
         self.crop_panel = QFrame()
@@ -4707,6 +5243,10 @@ class AnnotationTab(QWidget):
                 target = Tool.RECTANGLE
             elif kind == "text":
                 target = Tool.TEXT
+            elif kind == "line":
+                target = Tool.LINE
+            elif kind == "arrow":
+                target = Tool.ARROW
             else:
                 target = preferred or self._current_tool
         if target == Tool.MARKER:
@@ -4724,13 +5264,16 @@ class AnnotationTab(QWidget):
         elif target == Tool.CROP:
             self.panel_stack.setCurrentWidget(self.crop_panel)
             self._set_panel_active_state()
+        elif target in (Tool.LINE, Tool.ARROW):
+            self.panel_stack.setCurrentWidget(self.shape_panel)
+            self._set_panel_active_state(shape=True)
         else:
             self.panel_stack.setCurrentWidget(self._options_placeholder)
             self._set_panel_active_state()
-        tracking = target if target in (Tool.MARKER, Tool.RECTANGLE, Tool.TEXT, Tool.SELECTION, Tool.CROP) else Tool.NONE
+        tracking = target if target in (Tool.MARKER, Tool.RECTANGLE, Tool.TEXT, Tool.SELECTION, Tool.CROP, Tool.LINE, Tool.ARROW) else Tool.NONE
         self._sync_tool_action_checks(tracking)
 
-    def _set_panel_active_state(self, marker=False, rectangle=False, text=False, selection=False):
+    def _set_panel_active_state(self, marker=False, rectangle=False, text=False, selection=False, shape=False):
         if hasattr(self.selection_panel, "setVisible"):
             self.selection_panel.setVisible(bool(selection))
         if hasattr(self.marker_panel, "set_panel_active"):
@@ -4739,6 +5282,8 @@ class AnnotationTab(QWidget):
             self.rectangle_panel.set_panel_active(bool(rectangle))
         if hasattr(self.text_panel, "set_panel_active"):
             self.text_panel.set_panel_active(bool(text))
+        if hasattr(self.shape_panel, "set_panel_active"):
+            self.shape_panel.set_panel_active(bool(shape))
 
     def _sync_tool_action_checks(self, active_tool: Tool):
         actions = getattr(self, "_tool_actions", {})
@@ -4746,6 +5291,24 @@ class AnnotationTab(QWidget):
             action.blockSignals(True)
             action.setChecked(tool == active_tool)
             action.blockSignals(False)
+            
+        # 同步图形菜单项
+        shape_actions = getattr(self, "_shape_actions", {})
+        for tool, action in shape_actions.items():
+            action.blockSignals(True)
+            action.setChecked(tool == active_tool)
+            action.blockSignals(False)
+            
+        # 如果是图形工具，更新图形按钮的高亮状态
+        shapes_button = self.findChild(QToolButton, "Tool_shapes")
+        if shapes_button:
+            is_shape = active_tool in shape_actions
+            if is_shape:
+                # 更新按钮图标为当前选中的图形图标
+                shapes_button.setIcon(shape_actions[active_tool].icon())
+                shapes_button.setStyleSheet("background: rgba(95,39,205,0.18); color: #421aab;")
+            else:
+                shapes_button.setStyleSheet("")
 
     def _duplicate_active_shape(self):
         if not self.canvas.duplicate_active_shape():
@@ -5072,6 +5635,121 @@ class SelectionOptionsPanel(QFrame):
             self.canvas.selection_fill_color = QColor(color)
             self._update_color_button()
 
+
+class ShapeOptionsPanel(QFrame):
+    def __init__(self, canvas: AnnotationCanvas):
+        super().__init__()
+        self.canvas = canvas
+        self.setObjectName("ShapePanel")
+        self._accent = QColor("#5f27cd")
+        self.palette_buttons = []
+        self._apply_style()
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        palette_layout = QHBoxLayout()
+        palette_layout.setSpacing(4)
+        palette_label = QLabel("颜色")
+        palette_label.setStyleSheet("color:#2b3245;font-weight:600;font-size:12px;")
+        palette_layout.addWidget(palette_label)
+        for hex_color in CLASSIC_COLORS:
+            btn = QPushButton()
+            btn.setFixedSize(20, 20)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(f"background-color:{hex_color}; border-radius:6px; border:2px solid transparent;")
+            btn.clicked.connect(lambda _, c=QColor(hex_color): self._set_palette_color(c))
+            self.palette_buttons.append((btn, QColor(hex_color)))
+            palette_layout.addWidget(btn)
+        row.addLayout(palette_layout, 0)
+
+        options = QHBoxLayout()
+        options.setSpacing(6)
+        
+        def add_label(text):
+            label = QLabel(text)
+            label.setStyleSheet("color:#1e2433;font-size:12px;")
+            options.addWidget(label)
+            return label
+
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(64, 22)
+        self.color_btn.setCursor(Qt.PointingHandCursor)
+        self.color_btn.clicked.connect(self._choose_color)
+        options.addWidget(self.color_btn)
+
+        add_label("宽度")
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(1, 20)
+        self.width_spin.setFixedWidth(52)
+        self.width_spin.valueChanged.connect(self._on_width_changed)
+        options.addWidget(self.width_spin)
+        
+        options.addStretch()
+        row.addLayout(options, 1)
+        layout.addLayout(row)
+
+        self.setLayout(layout)
+        self.canvas.optionsUpdated.connect(self.sync_from_canvas)
+        self.sync_from_canvas()
+
+    def _apply_style(self):
+        accent = self._accent.name()
+        self.setStyleSheet(f"""
+            #ShapePanel {{
+                background-color: #ffffff;
+                border-top: 1px solid #e2e8f0;
+            }}
+        """)
+
+    def _set_palette_color(self, color):
+        self.canvas.update_selected_shape_color(color)
+        self.sync_from_canvas()
+
+    def _choose_color(self):
+        current = self.canvas.line_color
+        if self.canvas.selected_line_index is not None:
+            current = self.canvas.lines[self.canvas.selected_line_index]['color']
+        elif self.canvas.selected_arrow_index is not None:
+            current = self.canvas.arrows[self.canvas.selected_arrow_index]['color']
+        
+        color = QColorDialog.getColor(current, self, "选择颜色")
+        if color.isValid():
+            self.canvas.update_selected_shape_color(color)
+            self.sync_from_canvas()
+
+    def _on_width_changed(self, val):
+        self.canvas._push_undo_state()
+        if self.canvas.selected_line_index is not None:
+            self.canvas.lines[self.canvas.selected_line_index]['width'] = val
+            self.canvas.line_width = val
+        elif self.canvas.selected_arrow_index is not None:
+            self.canvas.arrows[self.canvas.selected_arrow_index]['width'] = val
+            self.canvas.arrow_width = val
+        self.canvas.optionsUpdated.emit()
+        self.canvas.update()
+
+    def sync_from_canvas(self):
+        color = self.canvas.line_color
+        width = self.canvas.line_width
+        
+        if self.canvas.selected_line_index is not None:
+            info = self.canvas.lines[self.canvas.selected_line_index]
+            color = info['color']
+            width = info['width']
+        elif self.canvas.selected_arrow_index is not None:
+            info = self.canvas.arrows[self.canvas.selected_arrow_index]
+            color = info['color']
+            width = info['width']
+            
+        self.color_btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid #ccc; border-radius: 4px;")
+        self.width_spin.blockSignals(True)
+        self.width_spin.setValue(width)
+        self.width_spin.blockSignals(False)
 
 class MarkerOptionsPanel(QFrame):
     def __init__(self, canvas: AnnotationCanvas):
@@ -5435,6 +6113,138 @@ class RectangleOptionsPanel(QFrame):
         self.canvas.set_rectangle_corner_radius(value)
         self.sync_from_canvas()
 
+
+class ShapeOptionsPanel(QFrame):
+    def __init__(self, canvas):
+        super().__init__()
+        self.canvas = canvas
+        self.setObjectName("ShapePanel")
+        self._accent = QColor("#5f27cd")
+        self._active = False
+        
+        self.setStyleSheet("""
+            QFrame#ShapePanel {
+                background: rgba(95,39,205,0.08);
+                border-radius: 10px;
+            }
+            QFrame#ShapePanel QLabel {
+                color: #421aab;
+                font-weight: 700;
+                font-size: 11px;
+            }
+            QFrame#ShapePanel QSpinBox, QFrame#ShapePanel QLineEdit {
+                border: 1px solid #cfd6e6;
+                border-radius: 4px;
+                padding: 2px 5px;
+                background: #ffffff;
+                color: #0f172a;
+            }
+            QPushButton[class="color-chip"] {
+                border-radius: 4px;
+                border: 1px solid #e2e8f0;
+            }
+            QPushButton[class="color-chip"][selected="true"] {
+                border: 2px solid #5f27cd;
+            }
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.setSpacing(10)
+
+        # 调色盘
+        palette_layout = QHBoxLayout()
+        palette_layout.setSpacing(4)
+        self.palette_buttons = []
+        colors = ["#ff4757", "#2ed3a3", "#5f27cd", "#f7b500", "#ffffff", "#000000"]
+        for hex_color in colors:
+            btn = QPushButton()
+            btn.setFixedSize(18, 18)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setProperty("class", "color-chip")
+            btn.setStyleSheet(f"background-color: {hex_color};")
+            btn.clicked.connect(lambda _, c=QColor(hex_color): self._apply_palette_color(c))
+            self.palette_buttons.append((btn, QColor(hex_color)))
+            palette_layout.addWidget(btn)
+        layout.addLayout(palette_layout)
+
+        # 颜色预览/选择
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(24, 24)
+        self.color_btn.setCursor(Qt.PointingHandCursor)
+        self.color_btn.clicked.connect(self._choose_color)
+        layout.addWidget(self.color_btn)
+
+        # 线宽
+        width_container = QWidget()
+        width_layout = QHBoxLayout(width_container)
+        width_layout.setContentsMargins(0,0,0,0)
+        width_layout.setSpacing(4)
+        self.width_label = QLabel("线宽")
+        width_layout.addWidget(self.width_label)
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(1, 20)
+        self.width_spin.setFixedWidth(45)
+        self.width_spin.valueChanged.connect(canvas.update_selected_shape_width)
+        width_layout.addWidget(self.width_spin)
+        layout.addWidget(width_container)
+        self.width_container = width_container
+
+        layout.addStretch()
+
+        self.canvas.optionsUpdated.connect(self.sync_from_canvas)
+        self.sync_from_canvas()
+
+    def set_panel_active(self, active: bool):
+        self._active = active
+        self.setProperty("active", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _apply_palette_color(self, color: QColor):
+        self.canvas.update_selected_shape_color(color)
+        self.sync_from_canvas()
+
+    def _choose_color(self):
+        color = QColorDialog.getColor(self.canvas.line_color, self, "选择颜色")
+        if color.isValid():
+            self.canvas.update_selected_shape_color(color)
+            self.sync_from_canvas()
+
+    def sync_from_canvas(self):
+        kind = self.canvas.active_selection_kind()
+        
+        # 决定哪些控件显示
+        is_line_or_arrow = (kind in ("line", "arrow"))
+        
+        self.width_container.setVisible(is_line_or_arrow)
+
+        # 获取当前选中项的颜色
+        current_color = self.canvas.line_color
+        if kind == "line":
+            if self.canvas.selected_line_index is not None and self.canvas.selected_line_index < len(self.canvas.lines):
+                item = self.canvas.lines[self.canvas.selected_line_index]
+                current_color = item['color']
+                self.width_spin.blockSignals(True)
+                self.width_spin.setValue(item['width'])
+                self.width_spin.blockSignals(False)
+        elif kind == "arrow":
+            if self.canvas.selected_arrow_index is not None and self.canvas.selected_arrow_index < len(self.canvas.arrows):
+                item = self.canvas.arrows[self.canvas.selected_arrow_index]
+                current_color = item['color']
+                self.width_spin.blockSignals(True)
+                self.width_spin.setValue(item['width'])
+                self.width_spin.blockSignals(False)
+        
+        self.color_btn.setStyleSheet(
+            f"background-color: {current_color.name()}; border: 2px solid #ffffff; border-radius: 4px;"
+        )
+        
+        # 同步调色盘高亮
+        for btn, c in self.palette_buttons:
+            btn.setProperty("selected", c == current_color)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
 
 class TextOptionsPanel(QFrame):
     def __init__(self, tab):
