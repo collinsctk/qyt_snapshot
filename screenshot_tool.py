@@ -7017,6 +7017,7 @@ class CaptureOverlay(QWidget):
         self.origin = None
         self.cursor_pos = None
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
         # 移除 WA_TranslucentBackground，确保它是一个完全不透明的静态显示层
         # self.setAttribute(Qt.WA_TranslucentBackground) 
         
@@ -7083,6 +7084,11 @@ class CaptureOverlay(QWidget):
         if event.key() == Qt.Key_Escape:
             self.canceled.emit()
             self.close()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.activateWindow()
+        self.setFocus()
 
     def _draw_magnifier(self, painter: QPainter):
         if self.cursor_pos is None:
