@@ -6427,17 +6427,12 @@ class AnnotationWorkspacePage(QWidget):
         action_bar.addWidget(self.border_color_btn)
 
         action_bar.addStretch(1)
-        self.copy_all_btn = QPushButton("多图复制到剪贴板")
-        self.copy_all_btn.setToolTip("将当前打开的所有截图渲染为临时文件并写入剪贴板（微信/QQ 可一次粘贴多图）。")
-        self.copy_all_btn.setEnabled(False)
-        self.copy_all_btn.clicked.connect(self._copy_all_tabs_to_clipboard)
 
         self.clear_all_btn = QPushButton("清空所有标签")
         self.clear_all_btn.setToolTip("清空当前所有已打开的截图标签页。")
         self.clear_all_btn.setEnabled(False)
         self.clear_all_btn.clicked.connect(self.clear_all_tabs)
 
-        action_bar.addWidget(self.copy_all_btn, 0, Qt.AlignRight)
         action_bar.addWidget(self.clear_all_btn, 0, Qt.AlignRight)
         layout.addLayout(action_bar)
 
@@ -6503,8 +6498,6 @@ class AnnotationWorkspacePage(QWidget):
         has_tabs = self.tabs.count() > 0
         self._empty_hint.setVisible(not has_tabs)
         self.tabs.setVisible(has_tabs)
-        if hasattr(self, "copy_all_btn"):
-            self.copy_all_btn.setEnabled(has_tabs)
         if hasattr(self, "clear_all_btn"):
             self.clear_all_btn.setEnabled(has_tabs)
 
@@ -6735,44 +6728,6 @@ class AnnotationWorkspacePage(QWidget):
                         self._tab_scroll_last_cause = "tabbar_input"
                     QTimer.singleShot(0, self._update_tab_scroll_anchor)
         return super().eventFilter(obj, event)
-
-    def _copy_all_tabs_to_clipboard(self):
-        tabs = list(self._iter_tabs())
-        if not tabs:
-            QMessageBox.information(self, "暂无截图", "请先创建或打开截图后再复制。")
-            return
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        target_dir = os.path.join(tempfile.gettempdir(), "ctk_snapshot_clipboard")
-        payloads = []
-        failures = []
-        for idx, tab in enumerate(tabs, 1):
-            try:
-                path, png_bytes, _ = tab._export_clipboard_image(
-                    flatten=False,
-                    target_dir=target_dir,
-                    stamp=stamp,
-                    index=idx,
-                )
-                payloads.append((path, png_bytes))
-            except Exception as exc:
-                failures.append(str(exc))
-        if not payloads:
-            QMessageBox.warning(self, "复制失败", "未能生成可复制的图片文件，请检查写入权限。")
-            return
-        mime = QMimeData()
-        mime.setUrls([QUrl.fromLocalFile(path) for path, _ in payloads])
-        if payloads[0][1]:
-            mime.setData("image/png", payloads[0][1])
-        if not _set_clipboard_mime_with_retry(mime):
-            QMessageBox.warning(self, "复制失败", "无法写入剪贴板，请稍后重试。")
-            return
-        copied_msg = f"已将 {len(payloads)} 张图片复制为文件到剪贴板"
-        current_tab = self.tabs.currentWidget()
-        if current_tab and hasattr(current_tab, "status_label"):
-            current_tab.status_label.setText(f"{copied_msg}（可直接在微信粘贴多图）")
-        if failures:
-            detail = "\n".join(failures[:3])
-            QMessageBox.warning(self, "部分复制失败", f"{copied_msg}，但有 {len(failures)} 张未生成：\n{detail}")
 
     def add_capture(self, pixmap: QPixmap, save_dir: str, initial_zoom=1.0):
         self._create_tab(pixmap, save_dir, initial_zoom=initial_zoom)
