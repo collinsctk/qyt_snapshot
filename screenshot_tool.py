@@ -4336,15 +4336,10 @@ class AnnotationTab(QWidget):
         delete_action.triggered.connect(self._delete_selected)
         toolbar.addAction(delete_action)
 
-        duplicate_action = QAction("复制当前", self)
+        duplicate_action = QAction("克隆标注", self)
         duplicate_action.setIcon(_make_tool_icon("duplicate", "#e0f2fe", "#0f172a"))
         duplicate_action.triggered.connect(self._duplicate_active_shape)
         toolbar.addAction(duplicate_action)
-
-        flatten_action = QAction("平化", self)
-        flatten_action.setIcon(_make_tool_icon("flatten", "#e5e7eb", "#1f2937"))
-        flatten_action.triggered.connect(self.canvas.flatten_markers)
-        toolbar.addAction(flatten_action)
 
         save_action = QAction("保存标注图", self)
         save_action.setIcon(_make_tool_icon("save", "#ede9fe", "#4338ca"))
@@ -4754,7 +4749,7 @@ class AnnotationTab(QWidget):
 
     def _duplicate_active_shape(self):
         if not self.canvas.duplicate_active_shape():
-            QApplication.beep()
+            self.status_label.setText("请先选中一个标注再复制")
 
     def request_canvas_autoscroll(self, canvas_pos: QPoint):
         scroll = getattr(self, "_scroll_area", None)
