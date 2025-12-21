@@ -7012,7 +7012,16 @@ class CaptureOverlay(QWidget):
         overlay_color = QColor(0, 0, 0, 120)
         painter.fillRect(self.rect(), overlay_color)
 
-        # 3. 如果有选区，在高亮区重新绘制原始清晰图
+        # 3. 全屏十字准线（帮助对齐）
+        if self.cursor_pos:
+            pen = QPen(QColor(0, 200, 255, 200), 1, Qt.SolidLine)
+            painter.setPen(pen)
+            # 水平线：贯穿屏幕宽度
+            painter.drawLine(0, self.cursor_pos.y(), self.width(), self.cursor_pos.y())
+            # 垂直线：贯穿屏幕高度
+            painter.drawLine(self.cursor_pos.x(), 0, self.cursor_pos.x(), self.height())
+
+        # 4. 如果有选区，在高亮区重新绘制原始清晰图
         if self.selection and self.selection.isValid():
             device_rect = self._device_rect(self.selection)
             painter.drawPixmap(self.selection, self.screenshot, device_rect)
