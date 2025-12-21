@@ -5439,27 +5439,27 @@ class AnnotationTab(QWidget):
             QMessageBox.information(self, "无法撤销", "当前没有可撤销的操作。")
 
     def _copy_to_clipboard(self):
-        # region agent log
-        # H3/H5: 复制前的状态（尤其是 Esc 失败后的状态机）与焦点
+        # #region agent log
+        # 假设A/B: 检查 _copy_to_clipboard 是否被调用，以及当前焦点
         try:
             focus = QApplication.focusWidget()
             focus_name = focus.__class__.__name__ if focus else None
+            focus_obj = str(focus.objectName()) if focus and focus.objectName() else "no_name"
         except Exception:
             focus_name = None
+            focus_obj = "error"
         _agent_debug_log(
-            hypothesisId="H5",
+            hypothesisId="A_B",
             location="screenshot_tool.py:AnnotationTab._copy_to_clipboard",
-            message="copy_to_clipboard begin",
+            message="copy_to_clipboard CALLED - shortcut triggered",
             data={
                 "_current_tool": getattr(self, "_current_tool", None).name if getattr(self, "_current_tool", None) else None,
                 "active_selection_kind": self.canvas.active_selection_kind() if hasattr(self, "canvas") else None,
-                "markers_flattened": bool(getattr(self.canvas, "markers_flattened", True)),
-                "dragging_marker_index": getattr(self.canvas, "dragging_marker_index", None),
-                "_marker_dragging": bool(getattr(self.canvas, "_marker_dragging", False)),
-                "focusWidget": focus_name,
+                "focusWidget_class": focus_name,
+                "focusWidget_name": focus_obj,
             },
         )
-        # endregion
+        # #endregion
         # 临时 PNG 文件，便于部分应用（PPT/笔记）读取透明通道
         tmp_path, png_bytes, _ = self._export_clipboard_image(flatten=True)
         # region agent log
@@ -6468,6 +6468,19 @@ class AnnotationWorkspacePage(QWidget):
         # endregion
 
     def _on_global_border_width_changed(self, value):
+        # #region agent log
+        try:
+            focus_before = QApplication.focusWidget()
+            focus_name_before = focus_before.__class__.__name__ if focus_before else None
+        except Exception:
+            focus_name_before = None
+        _agent_debug_log(
+            hypothesisId="A",
+            location="screenshot_tool.py:_on_global_border_width_changed",
+            message="border width changed - focus check",
+            data={"value": value, "focus_widget": focus_name_before},
+        )
+        # #endregion
         data = {"width": value}
         self._style_state.setdefault("image_border", {}).update(data)
         self._style_callback("image_border", data)
