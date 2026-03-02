@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -4659,6 +4659,17 @@ class AnnotationTab(QWidget):
                 painter.drawRoundedRect(rectf(18, 18, 18, 20), sc(4), sc(4))
                 painter.setPen(QPen(QColor(stroke_color), sc(2)))
                 painter.drawRoundedRect(rectf(18, 18, 18, 20), sc(4), sc(4))
+            elif kind == "copy":
+                # 复制图标：两张叠放的卡片 + 角标
+                painter.setBrush(QColor(base_color))
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(rectf(12, 12, 20, 22), sc(4), sc(4))
+                painter.setBrush(QColor("#ffffff"))
+                painter.setPen(QPen(QColor(stroke_color), sc(2)))
+                painter.drawRoundedRect(rectf(16, 16, 20, 22), sc(4), sc(4))
+                painter.setPen(QPen(QColor(stroke_color), sc(2.4), Qt.SolidLine, Qt.RoundCap))
+                painter.drawLine(QPointF(sc(20), sc(24)), QPointF(sc(30), sc(24)))
+                painter.drawLine(QPointF(sc(20), sc(29)), QPointF(sc(32), sc(29)))
             elif kind == "line":
                 painter.setBrush(Qt.NoBrush)
                 painter.drawLine(QPointF(sc(12), sc(36)), QPointF(sc(36), sc(12)))
@@ -4872,6 +4883,12 @@ class AnnotationTab(QWidget):
         duplicate_action.setIcon(_make_tool_icon("duplicate", "#e0f2fe", "#0f172a"))
         duplicate_action.triggered.connect(self._duplicate_active_shape)
         toolbar.addAction(duplicate_action)
+
+        copy_action = QAction("复制当前状态", self)
+        copy_action.setIcon(_make_tool_icon("copy", "#dcfce7", "#166534"))
+        copy_action.setToolTip("复制当前画面（包含未保存的修改内容）到剪贴板")
+        copy_action.triggered.connect(self._copy_to_clipboard)
+        toolbar.addAction(copy_action)
 
         save_action = QAction("保存标注图", self)
         save_action.setIcon(_make_tool_icon("save", "#ede9fe", "#4338ca"))
@@ -5439,8 +5456,8 @@ class AnnotationTab(QWidget):
             QMessageBox.information(self, "无法撤销", "当前没有可撤销的操作。")
 
     def _copy_to_clipboard(self):
-        # #region agent log
-        # 假设A/B: 检查 _copy_to_clipboard 是否被调用，以及当前焦点
+        # 复制“当前状态”：包含所有未保存修改（标注、裁切、选区像素修改、边框等）
+        # 兼容策略：同时写入 image（Qt 会映射到 Windows 原生格式）+ image/png + 本地临时文件 URL
         try:
             focus = QApplication.focusWidget()
             focus_name = focus.__class__.__name__ if focus else None
@@ -5451,7 +5468,7 @@ class AnnotationTab(QWidget):
         _agent_debug_log(
             hypothesisId="A_B",
             location="screenshot_tool.py:AnnotationTab._copy_to_clipboard",
-            message="copy_to_clipboard CALLED - shortcut triggered",
+            message="copy_to_clipboard CALLED",
             data={
                 "_current_tool": getattr(self, "_current_tool", None).name if getattr(self, "_current_tool", None) else None,
                 "active_selection_kind": self.canvas.active_selection_kind() if hasattr(self, "canvas") else None,
@@ -5459,35 +5476,23 @@ class AnnotationTab(QWidget):
                 "focusWidget_name": focus_obj,
             },
         )
-        # #endregion
-        # 临时 PNG 文件，便于部分应用（PPT/笔记）读取透明通道
-        tmp_path, png_bytes, _ = self._export_clipboard_image(flatten=True)
-        # region agent log
-        # H3/H5: 临时文件与 PNG 字节是否有效（PPT 若优先读 URL，文件是否存在/大小是否为 0）
-        try:
-            exists = os.path.exists(tmp_path) if tmp_path else False
-            fsize = os.path.getsize(tmp_path) if exists else None
-        except Exception:
-            exists, fsize = False, None
-        _agent_debug_log(
-            hypothesisId="H3",
-            location="screenshot_tool.py:AnnotationTab._copy_to_clipboard",
-            message="clipboard export done",
-            data={
-                "tmp_path": tmp_path,
-                "file_exists": bool(exists),
-                "file_size": fsize,
-                "png_bytes_len": len(png_bytes) if png_bytes else 0,
-            },
-        )
-        # endregion
+
+        exported_pixmap = self.canvas.export_pixmap()
+        tmp_path, png_bytes, qimage = self._export_clipboard_image(flatten=False)
         mime = QMimeData()
-        mime.setData("image/png", png_bytes)
-        mime.setUrls([QUrl.fromLocalFile(tmp_path)])
+        if qimage is not None:
+            mime.setImageData(qimage)
+        if png_bytes:
+            mime.setData("image/png", png_bytes)
+        if tmp_path:
+            mime.setUrls([QUrl.fromLocalFile(tmp_path)])
+
         clipboard = QApplication.clipboard()
         ok = _set_clipboard_mime_with_retry(mime)
-        # region agent log
-        # H3: 写入剪贴板是否成功？写入后的 formats 是什么？（避免泄露内容，仅记录类型）
+        if not ok:
+            # 兜底：部分环境下 setMimeData 不稳定，改用 setPixmap（Windows 原生粘贴更稳）
+            ok = _set_clipboard_pixmap_with_retry(exported_pixmap)
+
         try:
             fmts = list(clipboard.mimeData().formats()) if clipboard and clipboard.mimeData() else []
         except Exception:
@@ -5495,40 +5500,18 @@ class AnnotationTab(QWidget):
         _agent_debug_log(
             hypothesisId="H3",
             location="screenshot_tool.py:AnnotationTab._copy_to_clipboard",
-            message="clipboard setMimeData result",
+            message="clipboard write result",
             data={
                 "ok": bool(ok),
                 "formats": fmts[:20],
+                "has_image": "application/x-qt-image" in fmts or "image/bmp" in fmts or "image/png" in fmts,
                 "has_image_png": "image/png" in fmts,
                 "has_urls": "text/uri-list" in fmts,
             },
         )
-        # endregion
+
         if ok:
-            self.status_label.setText("已复制到剪贴板")
-            self._mark_dirty()
-            # region agent log
-            # H1: 复制完成后延迟检查滚动位置是否变化
-            def _delayed_scroll_check():
-                try:
-                    workspace = self.parent()
-                    while workspace and not hasattr(workspace, '_current_scroll_offset'):
-                        workspace = workspace.parent()
-                    if workspace:
-                        _agent_debug_log(
-                            hypothesisId="H1",
-                            location="screenshot_tool.py:AnnotationTab._copy_to_clipboard._delayed_scroll_check",
-                            message="copy finished delayed scroll check",
-                            data={
-                                "offset_now": workspace._current_scroll_offset(),
-                                "visible_range": workspace._tab_visible_range(),
-                                "currentIndex": workspace.tabs.currentIndex(),
-                            },
-                        )
-                except Exception:
-                    pass
-            QTimer.singleShot(50, _delayed_scroll_check)
-            # endregion
+            self.status_label.setText("已复制当前状态到剪贴板")
         else:
             self.status_label.setText("复制到剪贴板失败，请重试。")
             QMessageBox.warning(self, "复制失败", "无法写入剪贴板，请稍后重试。")
@@ -6518,6 +6501,20 @@ class AnnotationWorkspacePage(QWidget):
         super().showEvent(event)
         # 页面显示时不自动触发 restore_last_active_tab 的滚动逻辑
         # QTimer.singleShot(0, self.restore_last_active_tab)
+        # region agent log
+        try:
+            focus_widget = QApplication.focusWidget()
+            focus_name = focus_widget.__class__.__name__ if focus_widget else None
+            focus_obj_name = focus_widget.objectName() if focus_widget else None
+        except Exception:
+            focus_name = focus_obj_name = None
+        _agent_debug_log(
+            hypothesisId="B",
+            location="screenshot_tool.py:AnnotationWorkspacePage.showEvent",
+            message="workspace page showEvent focus check",
+            data={"focus_widget": focus_name, "focus_obj_name": focus_obj_name},
+        )
+        # endregion
 
     def _remember_active_tab(self, index):
         try:
@@ -6871,6 +6868,20 @@ class AnnotationWorkspacePage(QWidget):
         tab._set_tool(Tool.RECTANGLE)
         QTimer.singleShot(0, self._restore_tab_scroll_anchor)
         self._update_hint_visibility()
+        # region agent log
+        try:
+            focus_widget = QApplication.focusWidget()
+            focus_name = focus_widget.__class__.__name__ if focus_widget else None
+            focus_obj_name = focus_widget.objectName() if focus_widget else None
+        except Exception:
+            focus_name = focus_obj_name = None
+        _agent_debug_log(
+            hypothesisId="C",
+            location="screenshot_tool.py:_create_tab:end",
+            message="focus after _create_tab",
+            data={"focus_widget": focus_name, "focus_obj_name": focus_obj_name},
+        )
+        # endregion
 
     def _bind_tab_signals(self, tab):
         tab.dirtyStateChanged.connect(lambda dirty, t=tab: self._update_tab_color(t, dirty))
@@ -7590,12 +7601,26 @@ class ScreenSnapApp(QMainWindow):
         self._resize_for_image(pixmap.size())
         _set_clipboard_pixmap_with_retry(pixmap)
         # region agent log
-        # H4: “区域截图后直接 Ctrl+V”走 setPixmap，记录以对照 PPT 报错概率
+        # H4: "区域截图后直接 Ctrl+V"走 setPixmap，记录以对照 PPT 报错概率
         _agent_debug_log(
             hypothesisId="H4",
             location="screenshot_tool.py:ScreenSnapApp._handle_annotation_capture",
             message="annotation_capture wrote clipboard via setPixmap",
             data={"size": (pixmap.width(), pixmap.height()) if pixmap else None, "screen": screen_name},
+        )
+        # endregion
+        # region agent log
+        try:
+            focus_widget = QApplication.focusWidget()
+            focus_name = focus_widget.__class__.__name__ if focus_widget else None
+            focus_obj_name = focus_widget.objectName() if focus_widget else None
+        except Exception:
+            focus_name = focus_obj_name = None
+        _agent_debug_log(
+            hypothesisId="A",
+            location="screenshot_tool.py:_handle_annotation_capture:end",
+            message="focus after annotation capture",
+            data={"focus_widget": focus_name, "focus_obj_name": focus_obj_name},
         )
         # endregion
         logging.info("Annotation capture handled; size=%s", pixmap.size())
@@ -7613,6 +7638,8 @@ class ScreenSnapApp(QMainWindow):
             },
         )
         # endregion
+        # 默认截图后直接写入剪贴板（与“区域截图/重复截图”保持一致）
+        _set_clipboard_pixmap_with_retry(pixmap)
         self._last_selection_rect = QRect(selection_rect)
         self._last_capture_screen_name = screen_name
         self.home_page.set_repeat_enabled(True)
