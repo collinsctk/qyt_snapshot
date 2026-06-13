@@ -12,6 +12,7 @@ import time
 import tempfile
 import logging
 import atexit
+import copy
 import signal
 import winreg
 import threading  # 新增：用于异步 IO
@@ -34,10 +35,13 @@ except ImportError:
 # Debug Mode: 运行时证据日志（NDJSON），写入 Cursor 提供的固定路径
 _AGENT_DEBUG_LOG_PATH = r"c:\Users\ThinkPad\CursorProjects\snapshot\.cursor\debug.log"
 _AGENT_DEBUG_SESSION_ID = "debug-session"
+_AGENT_DEBUG_ENABLED = os.environ.get("CTK_SNAPSHOT_DEBUG_LOG") == "1"
 
 
 def _agent_debug_log(*, hypothesisId: str, location: str, message: str, data=None, runId: str = "pre-fix"):
     """写入 NDJSON 调试日志（避免写入任何敏感信息/PII）。"""
+    if not _AGENT_DEBUG_ENABLED:
+        return
     try:
         payload = {
             "timestamp": int(time.time() * 1000),
@@ -139,6 +143,7 @@ from PyQt5.QtWidgets import (
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
 
 
 def _determine_user_data_dir():
@@ -166,7 +171,7 @@ LEGACY_USER_CONFIG_FILE = os.path.join(BASE_DIR, "user.json")
 USER_CONFIG_FILE = os.path.join(USER_DATA_DIR, "user.json")
 DEFAULT_SAVE_DIR = os.path.join(USER_DATA_DIR, "screenshots")
 LOG_FILE = os.path.join(USER_DATA_DIR, "snapshot.log")
-ICON_PATH = os.path.join(BASE_DIR, "favicon", "favicon.ico")
+ICON_PATH = os.path.join(RESOURCE_DIR, "favicon", "favicon.ico")
 _APP_ICON = None
 CLASSIC_COLORS = [
     "#FF6B6B",
@@ -381,6 +386,32 @@ def _dynamic_tab_label_length(tab_widget) -> int:
     max_len = int(avg_width / char_px)
     return max(6, min(20, max_len))
 
+
+def _color_chip_style(color, radius=6, border="transparent"):
+    return (
+        f"QPushButton {{ background-color:{color}; border-radius:{radius}px; border:2px solid {border}; }}"
+        "QPushButton:hover { border:2px solid #2c7afa; }"
+        "QPushButton:pressed { border:2px solid #1d4ed8; }"
+    )
+
+
+def _preview_chip_style(color, radius=6):
+    return (
+        f"QPushButton {{ background-color:{color}; border:1px solid #cfd6e6; border-radius:{radius}px; }}"
+        "QPushButton:hover { border:2px solid #2c7afa; }"
+        "QPushButton:pressed { border:2px solid #1d4ed8; }"
+    )
+
+
+def _solid_button_style(bg, hover_bg, pressed_bg, color="#ffffff"):
+    return (
+        f"QPushButton {{ background:{bg}; color:{color}; border:1px solid transparent; "
+        "border-radius:6px; padding:6px 10px; font-weight:600; }"
+        f"QPushButton:hover {{ background:{hover_bg}; border-color:#93c5fd; }}"
+        f"QPushButton:pressed {{ background:{pressed_bg}; border-color:#1d4ed8; }}"
+        "QPushButton:disabled { background:#f1f5f9; color:#94a3b8; border-color:#e2e8f0; }"
+    )
+
 DEFAULT_IMAGE_QUALITY = 95
 AI_TRANSLATION_PROMPT = (
     "请识别这张截图里的所有文字（保留原始顺序、标点和空格），并识别原文中的加粗/强调。"
@@ -502,18 +533,50 @@ def _show_message_box(title, text, parent=None, critical=False):
         print(f"{title}: {text}", file=sys.stderr)
 
 
-def save_config(data, parent=None):
-    """异步保存配置文件，避免阻塞主线程"""
-    def _do_save():
-        try:
-            os.makedirs(USER_DATA_DIR, exist_ok=True)
-            with open(USER_CONFIG_FILE, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2, ensure_ascii=False)
-        except OSError as exc:
-            logging.error(f"Failed to save config: {exc}")
-            # 异步保存时如果出错，不弹出阻塞对话框，仅记录日志
+_CONFIG_SAVE_LOCK = threading.Lock()
+_CONFIG_SAVE_TIMER = None
+_CONFIG_SAVE_PENDING = None
+_CONFIG_SAVE_DELAY_SECONDS = 0.35
 
-    threading.Thread(target=_do_save, daemon=True).start()
+
+def _write_config_snapshot(data):
+    try:
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
+        tmp_path = USER_CONFIG_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, USER_CONFIG_FILE)
+    except OSError as exc:
+        logging.error(f"Failed to save config: {exc}")
+
+
+def _flush_pending_config_save():
+    global _CONFIG_SAVE_TIMER, _CONFIG_SAVE_PENDING
+    with _CONFIG_SAVE_LOCK:
+        data = _CONFIG_SAVE_PENDING
+        _CONFIG_SAVE_PENDING = None
+        _CONFIG_SAVE_TIMER = None
+    if data is not None:
+        _write_config_snapshot(data)
+
+
+def save_config(data, parent=None):
+    """防抖异步保存配置，避免拖拽/绘制时频繁创建线程和写磁盘。"""
+    global _CONFIG_SAVE_TIMER, _CONFIG_SAVE_PENDING
+    try:
+        snapshot = copy.deepcopy(data)
+    except Exception:
+        snapshot = dict(data) if isinstance(data, dict) else data
+    with _CONFIG_SAVE_LOCK:
+        _CONFIG_SAVE_PENDING = snapshot
+        if _CONFIG_SAVE_TIMER is not None:
+            _CONFIG_SAVE_TIMER.cancel()
+        _CONFIG_SAVE_TIMER = threading.Timer(_CONFIG_SAVE_DELAY_SECONDS, _flush_pending_config_save)
+        _CONFIG_SAVE_TIMER.daemon = True
+        _CONFIG_SAVE_TIMER.start()
+
+
+atexit.register(_flush_pending_config_save)
 
 
 def _normalized_ai_settings(settings):
@@ -1934,6 +1997,7 @@ class ActionButton(QPushButton):
             "QPushButton { text-align: left; padding: 12px 16px; border: 1px solid #dfe3eb; border-radius: 8px; "
             "background: #ffffff; font-size: 14px; }"
             "QPushButton:hover { background: #f5f7fb; border-color: #a8c3ff; }"
+            "QPushButton:pressed { background: #e6efff; border-color: #2c7afa; color: #0f2f6f; }"
             "QPushButton:disabled { color: #999999; border-style: dashed; }"
         )
         if callback:
@@ -4715,6 +4779,15 @@ class AnnotationTab(QWidget):
                 min-width: 54px;
                 qproperty-iconSize: 30px;
             }
+            QToolBar#AnnotationToolbar QToolButton:hover {
+                border: 1px solid rgba(44,122,250,0.45);
+                background: rgba(44,122,250,0.10);
+            }
+            QToolBar#AnnotationToolbar QToolButton:pressed {
+                border: 1px solid rgba(44,122,250,0.75);
+                background: rgba(44,122,250,0.22);
+                color: #0f2f6f;
+            }
             QToolBar#AnnotationToolbar QToolButton::menu-indicator { width: 0; height: 0; }
             QToolBar#AnnotationToolbar QToolButton#Tool_rect {
                 background: rgba(95,39,205,0.18);
@@ -4961,6 +5034,10 @@ class AnnotationTab(QWidget):
 
         status_layout = QHBoxLayout()
         self.status_label = QLabel(self.base_status_text)
+        self._set_status_neutral_style()
+        self._feedback_timer = QTimer(self)
+        self._feedback_timer.setSingleShot(True)
+        self._feedback_timer.timeout.connect(self._set_status_neutral_style)
         self.zoom_label = QLabel("100%")
         self.zoom_label.setStyleSheet("color: #4c566a;")
         status_layout.addWidget(self.status_label, 1)
@@ -5176,9 +5253,10 @@ class AnnotationTab(QWidget):
         base, _ = os.path.splitext(os.path.basename(self.auto_saved_path))
         annotated_path = os.path.join(self.save_dir, f"{base}_annotated.png")
         if annotated.save(annotated_path, "PNG", self.image_quality):
-            self.status_label.setText(f"标注图已保存: {annotated_path}")
             self._set_dirty(False)
+            self._show_feedback(f"标注图已保存: {annotated_path}")
             return True
+        self._show_feedback("保存失败，请检查保存路径。", "error")
         QMessageBox.warning(self, "保存失败", "无法写入标注截图，请检查保存路径。")
         return False
 
@@ -5323,13 +5401,20 @@ class AnnotationTab(QWidget):
             if is_shape:
                 # 更新按钮图标为当前选中的图形图标
                 shapes_button.setIcon(shape_actions[active_tool].icon())
-                shapes_button.setStyleSheet("background: rgba(95,39,205,0.18); color: #421aab;")
+                shapes_button.setStyleSheet(
+                    "QToolButton { background: rgba(95,39,205,0.18); color: #421aab; "
+                    "border:1px solid transparent; border-radius:7px; }"
+                    "QToolButton:hover { background: rgba(95,39,205,0.28); border-color:#8b5cf6; }"
+                    "QToolButton:pressed { background: #5f27cd; color:#ffffff; border-color:#ffffff; }"
+                )
             else:
                 shapes_button.setStyleSheet("")
 
     def _duplicate_active_shape(self):
-        if not self.canvas.duplicate_active_shape():
-            self.status_label.setText("请先选中一个标注再复制")
+        if self.canvas.duplicate_active_shape():
+            self._show_feedback("已克隆当前标注")
+        else:
+            self._show_feedback("请先选中一个标注再复制", "warn")
 
     def request_canvas_autoscroll(self, canvas_pos: QPoint):
         scroll = getattr(self, "_scroll_area", None)
@@ -5391,7 +5476,6 @@ class AnnotationTab(QWidget):
 
     def _mark_dirty(self):
         self.status_label.setText(f"{self.base_status_text} *未保存")
-        self._persist_style_defaults()
         self._set_dirty(True)
 
     def _set_dirty(self, dirty):
@@ -5419,6 +5503,26 @@ class AnnotationTab(QWidget):
         if self.auto_save_enabled:
             return f"自动保存: {self.auto_saved_path}"
         return f"尚未保存: {self.auto_saved_path}"
+
+    def _set_status_neutral_style(self):
+        if hasattr(self, "status_label"):
+            self.status_label.setStyleSheet(
+                "color: #4c566a; padding: 4px 8px; border: 1px solid transparent; border-radius: 6px;"
+            )
+
+    def _show_feedback(self, message, kind="success"):
+        if not hasattr(self, "status_label"):
+            return
+        if kind == "error":
+            style = "background: #fee2e2; color: #7f1d1d; border: 1px solid #fca5a5;"
+        elif kind == "warn":
+            style = "background: #fef3c7; color: #78350f; border: 1px solid #fcd34d;"
+        else:
+            style = "background: #dcfce7; color: #14532d; border: 1px solid #86efac;"
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(f"{style} padding: 4px 8px; border-radius: 6px; font-weight: 700;")
+        if hasattr(self, "_feedback_timer"):
+            self._feedback_timer.start(1600)
 
     def _safe_clipboard_basename(self):
         raw = os.path.splitext(os.path.basename(self.auto_saved_path or ""))[0]
@@ -5450,9 +5554,10 @@ class AnnotationTab(QWidget):
 
     def _undo_last_action(self):
         if self.canvas.undo_last_shape():
-            self.status_label.setText("已撤销上一次操作")
             self._mark_dirty()
+            self._show_feedback("已撤销上一次操作")
         else:
+            self._show_feedback("当前没有可撤销的操作", "warn")
             QMessageBox.information(self, "无法撤销", "当前没有可撤销的操作。")
 
     def _copy_to_clipboard(self):
@@ -5511,32 +5616,36 @@ class AnnotationTab(QWidget):
         )
 
         if ok:
-            self.status_label.setText("已复制当前状态到剪贴板")
+            self._show_feedback("已复制当前状态到剪贴板")
         else:
-            self.status_label.setText("复制到剪贴板失败，请重试。")
+            self._show_feedback("复制到剪贴板失败，请重试。", "error")
             QMessageBox.warning(self, "复制失败", "无法写入剪贴板，请稍后重试。")
 
     def _delete_selected(self):
         if self.canvas.selection_rect:
             if self.canvas.clear_selection_pixels():
-                self.status_label.setText("选区已清空")
                 self._mark_dirty()
+                self._show_feedback("选区已清空为透明")
             return
         if self.canvas.delete_selected_shape():
-            self.status_label.setText("删除了当前选中")
             self._mark_dirty()
+            self._show_feedback("已删除当前选中")
         else:
+            self._show_feedback("没有可删除的选中内容", "warn")
             QApplication.beep()
 
     def _persist_style_defaults(self):
         if not self.style_callback:
             return
-        marker_style = self.canvas.marker_style_state()
-        rect_style = self.canvas.rectangle_style_state()
-        text_style = self.canvas.text_style_state()
-        self.style_callback("marker", marker_style)
-        self.style_callback("rectangle", rect_style)
-        self.style_callback("text", text_style)
+        for style_type, style in (
+            ("marker", self.canvas.marker_style_state()),
+            ("rectangle", self.canvas.rectangle_style_state()),
+            ("text", self.canvas.text_style_state()),
+        ):
+            current = self.style_state.get(style_type)
+            if current == style:
+                continue
+            self.style_callback(style_type, style)
 
     def maybe_close(self):
         if not self.dirty:
@@ -5569,10 +5678,19 @@ class SelectionOptionsPanel(QFrame):
             QFrame#SelectionPanel QPushButton {
                 background: #0ea5e9;
                 color: #ffffff;
-                border: none;
+                border: 1px solid transparent;
                 border-radius: 6px;
                 padding: 6px 10px;
                 font-weight: 600;
+            }
+            QFrame#SelectionPanel QPushButton:hover {
+                background: #38bdf8;
+                border-color: #7dd3fc;
+            }
+            QFrame#SelectionPanel QPushButton:pressed {
+                background: #075985;
+                color: #ffffff;
+                border-color: #0c4a6e;
             }
             """
         )
@@ -5590,13 +5708,13 @@ class SelectionOptionsPanel(QFrame):
         layout.addWidget(self.color_btn)
 
         fill_btn = QPushButton("填充选区")
-        fill_btn.setStyleSheet("background: #0ea5e9; color: #ffffff; border: none; border-radius: 6px; padding: 6px 10px; font-weight: 600;")
-        fill_btn.clicked.connect(lambda: self.canvas.fill_selection_pixels(self.canvas.selection_fill_color))
+        fill_btn.setStyleSheet(_solid_button_style("#0ea5e9", "#38bdf8", "#075985"))
+        fill_btn.clicked.connect(self._fill_selection)
         layout.addWidget(fill_btn)
 
         clear_btn = QPushButton("清除选区")
-        clear_btn.setStyleSheet("background: #0284c7; color: #ffffff; border: none; border-radius: 6px; padding: 6px 10px; font-weight: 600;")
-        clear_btn.clicked.connect(self.canvas.clear_selection_pixels)
+        clear_btn.setStyleSheet(_solid_button_style("#0284c7", "#0ea5e9", "#075985"))
+        clear_btn.clicked.connect(self._clear_selection)
         layout.addWidget(clear_btn)
 
         hint = QLabel("拖拽创建选区后，可清除为透明或填充颜色。")
@@ -5610,6 +5728,8 @@ class SelectionOptionsPanel(QFrame):
             self.canvas.selection_fill_color = color
         self.color_btn.setStyleSheet(
             f"QPushButton {{ background-color: {color.name(QColor.HexArgb)}; color: #0f172a; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 10px; }}"
+            "QPushButton:hover { border: 2px solid #2c7afa; }"
+            "QPushButton:pressed { border: 2px solid #1d4ed8; }"
         )
 
     def _choose_color(self):
@@ -5617,6 +5737,23 @@ class SelectionOptionsPanel(QFrame):
         if color.isValid():
             self.canvas.selection_fill_color = QColor(color)
             self._update_color_button()
+
+    def _notify_owner(self, message, kind="success"):
+        owner = getattr(self.canvas, "owner_tab", None)
+        if owner and hasattr(owner, "_show_feedback"):
+            owner._show_feedback(message, kind)
+
+    def _fill_selection(self):
+        if self.canvas.fill_selection_pixels(self.canvas.selection_fill_color):
+            self._notify_owner("选区已填充")
+        else:
+            self._notify_owner("请先拖出一个有效选区", "warn")
+
+    def _clear_selection(self):
+        if self.canvas.clear_selection_pixels():
+            self._notify_owner("选区已清空为透明")
+        else:
+            self._notify_owner("请先拖出一个有效选区", "warn")
 
 
 class ShapeOptionsPanel(QFrame):
@@ -5644,7 +5781,7 @@ class ShapeOptionsPanel(QFrame):
             btn = QPushButton()
             btn.setFixedSize(20, 20)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(f"background-color:{hex_color}; border-radius:6px; border:2px solid transparent;")
+            btn.setStyleSheet(_color_chip_style(hex_color))
             btn.clicked.connect(lambda _, c=QColor(hex_color): self._set_palette_color(c))
             self.palette_buttons.append((btn, QColor(hex_color)))
             palette_layout.addWidget(btn)
@@ -5729,7 +5866,7 @@ class ShapeOptionsPanel(QFrame):
             color = info['color']
             width = info['width']
             
-        self.color_btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid #ccc; border-radius: 4px;")
+        self.color_btn.setStyleSheet(_preview_chip_style(color.name(), radius=4))
         self.width_spin.blockSignals(True)
         self.width_spin.setValue(width)
         self.width_spin.blockSignals(False)
@@ -5761,7 +5898,7 @@ class MarkerOptionsPanel(QFrame):
             btn.setProperty("class", "color-chip")
             btn.setFixedSize(20, 20)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(f"background-color:{hex_color}; border-radius:6px; border:2px solid transparent;")
+            btn.setStyleSheet(_color_chip_style(hex_color))
             btn.setProperty("selected", False)
             btn.clicked.connect(lambda _, c=QColor(hex_color): self._set_palette_color(c))
             self.palette_buttons.append((btn, QColor(hex_color)))
@@ -5850,13 +5987,27 @@ class MarkerOptionsPanel(QFrame):
             QPushButton[class="option-chip"] {{
                 padding: 2px 12px;
                 border-radius: 6px;
-                border: none;
+                border: 1px solid transparent;
                 background: {button_bg};
                 font-weight: 600;
                 color: #ffffff;
             }}
+            QPushButton[class="option-chip"]:hover {{
+                background: {self._accent.lighter(125).name()};
+                border-color: #ffffff;
+            }}
+            QPushButton[class="option-chip"]:pressed {{
+                background: {self._accent.darker(115).name()};
+                border-color: #0f172a;
+            }}
             QPushButton[class="color-chip"] {{
                 border-radius: 6px;
+            }}
+            QPushButton[class="color-chip"]:hover {{
+                border-color: #2c7afa;
+            }}
+            QPushButton[class="color-chip"]:pressed {{
+                border-color: #1d4ed8;
             }}
             QPushButton[class="color-chip"][selected="true"] {{
                 border-color: {accent};
@@ -5875,9 +6026,7 @@ class MarkerOptionsPanel(QFrame):
 
     def _update_color_button(self):
         color = self.canvas.marker_fill_color
-        self.color_btn.setStyleSheet(
-            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; border-radius:6px;"
-        )
+        self.color_btn.setStyleSheet(_preview_chip_style(color.name(QColor.HexArgb)))
 
     def _choose_color(self):
         color = QColorDialog.getColor(self.canvas.marker_fill_color, self, "选择顺序标记填充色")
@@ -5899,9 +6048,7 @@ class MarkerOptionsPanel(QFrame):
 
     def _update_border_button(self):
         color = self.canvas.marker_border_color
-        self.border_color_btn.setStyleSheet(
-            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; border-radius:6px;"
-        )
+        self.border_color_btn.setStyleSheet(_preview_chip_style(color.name(QColor.HexArgb)))
 
     def _refresh_palette_highlight(self):
         for btn, palette_color in self.palette_buttons:
@@ -5966,7 +6113,7 @@ class RectangleOptionsPanel(QFrame):
             btn.setProperty("class", "color-chip")
             btn.setFixedSize(20, 20)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(f"background-color:{hex_color}; border-radius:6px; border:2px solid transparent;")
+            btn.setStyleSheet(_color_chip_style(hex_color))
             btn.clicked.connect(lambda _, c=QColor(hex_color): self._apply_palette_color(c))
             self.palette_buttons.append((btn, QColor(hex_color)))
             palette_layout.addWidget(btn)
@@ -6040,13 +6187,27 @@ class RectangleOptionsPanel(QFrame):
             QPushButton[class="option-chip"] {{
                 padding: 2px 12px;
                 border-radius: 6px;
-                border: none;
+                border: 1px solid transparent;
                 background: {button_bg};
                 font-weight: 600;
                 color: #ffffff;
             }}
+            QPushButton[class="option-chip"]:hover {{
+                background: {self._accent.lighter(130).name()};
+                border-color: #ffffff;
+            }}
+            QPushButton[class="option-chip"]:pressed {{
+                background: {self._accent.darker(115).name()};
+                border-color: #0f172a;
+            }}
             QPushButton[class="color-chip"] {{
                 border-radius: 6px;
+            }}
+            QPushButton[class="color-chip"]:hover {{
+                border-color: #2c7afa;
+            }}
+            QPushButton[class="color-chip"]:pressed {{
+                border-color: #1d4ed8;
             }}
             QPushButton[class="color-chip"][selected="true"] {{
                 border-color: {accent};
@@ -6081,9 +6242,7 @@ class RectangleOptionsPanel(QFrame):
 
     def sync_from_canvas(self):
         color = self.canvas.rectangle_border_color
-        self.color_btn.setStyleSheet(
-            f"background-color: {color.name(QColor.HexArgb)}; border: 1px solid #cfd6e6; padding: 4px; border-radius:6px;"
-        )
+        self.color_btn.setStyleSheet(_preview_chip_style(color.name(QColor.HexArgb)))
         self.width_spin.blockSignals(True)
         self.width_spin.setValue(self.canvas.rectangle_border_width)
         self.width_spin.blockSignals(False)
@@ -6126,6 +6285,12 @@ class ShapeOptionsPanel(QFrame):
                 border-radius: 4px;
                 border: 1px solid #e2e8f0;
             }
+            QPushButton[class="color-chip"]:hover {
+                border: 2px solid #2c7afa;
+            }
+            QPushButton[class="color-chip"]:pressed {
+                border: 2px solid #1d4ed8;
+            }
             QPushButton[class="color-chip"][selected="true"] {
                 border: 2px solid #5f27cd;
             }
@@ -6145,7 +6310,7 @@ class ShapeOptionsPanel(QFrame):
             btn.setFixedSize(18, 18)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setProperty("class", "color-chip")
-            btn.setStyleSheet(f"background-color: {hex_color};")
+            btn.setStyleSheet(_color_chip_style(hex_color, radius=4, border="#e2e8f0"))
             btn.clicked.connect(lambda _, c=QColor(hex_color): self._apply_palette_color(c))
             self.palette_buttons.append((btn, QColor(hex_color)))
             palette_layout.addWidget(btn)
@@ -6220,7 +6385,7 @@ class ShapeOptionsPanel(QFrame):
                 self.width_spin.blockSignals(False)
         
         self.color_btn.setStyleSheet(
-            f"background-color: {current_color.name()}; border: 2px solid #ffffff; border-radius: 4px;"
+            _preview_chip_style(current_color.name(), radius=4)
         )
         
         # 同步调色盘高亮
@@ -6276,6 +6441,7 @@ class TextOptionsPanel(QFrame):
         self.bg_color_btn.clicked.connect(self._choose_background_color)
         layout.addWidget(self.bg_color_btn)
         self.transparent_btn = QPushButton("透明")
+        self.transparent_btn.setObjectName("TextTransparentButton")
         self.transparent_btn.setCursor(Qt.PointingHandCursor)
         self.transparent_btn.setProperty("class", "option-chip")
         self.transparent_btn.clicked.connect(self._set_transparent_background)
@@ -6298,6 +6464,22 @@ class TextOptionsPanel(QFrame):
             }}
             QFrame#TextPanel[active="true"] {{
                 background-color: {accent};
+            }}
+            QFrame#TextPanel QPushButton[class="option-chip"] {{
+                background: #fff7ed;
+                color: #7c2d12;
+                border: 1px solid #fdba74;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }}
+            QFrame#TextPanel QPushButton[class="option-chip"]:hover {{
+                background: #ffedd5;
+                border-color: #f97316;
+            }}
+            QFrame#TextPanel QPushButton[class="option-chip"]:pressed {{
+                background: #fed7aa;
+                border-color: #c2410c;
             }}
             """
         )
@@ -6322,15 +6504,11 @@ class TextOptionsPanel(QFrame):
 
     def _update_color_button(self):
         color = self.canvas.text_color
-        self.color_btn.setStyleSheet(
-            f"background-color: {color.name(QColor.HexArgb)}; border-radius: 4px; border: 1px solid #cfd6e6;"
-        )
+        self.color_btn.setStyleSheet(_preview_chip_style(color.name(QColor.HexArgb), radius=4))
 
     def _update_bg_color_button(self):
         bg = self.canvas.text_background_color
-        self.bg_color_btn.setStyleSheet(
-            f"background-color: {bg.name(QColor.HexArgb)}; border-radius: 4px; border: 1px solid #cfd6e6;"
-        )
+        self.bg_color_btn.setStyleSheet(_preview_chip_style(bg.name(QColor.HexArgb), radius=4))
 
     def _choose_color(self):
         color = QColorDialog.getColor(self.canvas.text_color, self, "选择文字颜色")
@@ -6405,7 +6583,7 @@ class AnnotationWorkspacePage(QWidget):
         self.border_color_btn.setCursor(Qt.PointingHandCursor)
         self.border_color_btn.setToolTip("选择边框颜色")
         initial_color = initial_border.get("color", "#FF7043")
-        self.border_color_btn.setStyleSheet(f"background-color: {initial_color}; border: 1px solid #ccc; border-radius: 4px;")
+        self.border_color_btn.setStyleSheet(_preview_chip_style(initial_color, radius=4))
         self.border_color_btn.clicked.connect(self._on_global_border_color_clicked)
         action_bar.addWidget(self.border_color_btn)
 
@@ -6414,6 +6592,7 @@ class AnnotationWorkspacePage(QWidget):
         self.clear_all_btn = QPushButton("清空所有标签")
         self.clear_all_btn.setToolTip("清空当前所有已打开的截图标签页。")
         self.clear_all_btn.setEnabled(False)
+        self.clear_all_btn.setStyleSheet(_solid_button_style("#f8fafc", "#e0f2fe", "#bae6fd", color="#0f172a"))
         self.clear_all_btn.clicked.connect(self.clear_all_tabs)
 
         action_bar.addWidget(self.clear_all_btn, 0, Qt.AlignRight)
@@ -6477,7 +6656,7 @@ class AnnotationWorkspacePage(QWidget):
         color = QColorDialog.getColor(current_color, self, "选择截图边框颜色")
         if color.isValid():
             hex_color = color.name()
-            self.border_color_btn.setStyleSheet(f"background-color: {hex_color}; border: 1px solid #ccc; border-radius: 4px;")
+            self.border_color_btn.setStyleSheet(_preview_chip_style(hex_color, radius=4))
             data = {"color": hex_color}
             self._style_state.setdefault("image_border", {}).update(data)
             self._style_callback("image_border", data)
@@ -6603,14 +6782,29 @@ class AnnotationWorkspacePage(QWidget):
             self._update_tab_scroll_anchor()
         anchor = self._tab_scroll_anchor
         offset = self._tab_scroll_offset
+        bar = self.tabs.tabBar()
+        updates_enabled = True
+        if bar:
+            updates_enabled = bar.updatesEnabled()
+            bar.setUpdatesEnabled(False)
         self._tab_scroll_lock = True
         try:
             yield
         finally:
             self._tab_scroll_anchor = anchor
             self._tab_scroll_offset = offset
+            self._restore_tab_scroll_anchor()
             self._tab_scroll_lock = False
-            QTimer.singleShot(0, self._restore_tab_scroll_anchor)
+            if bar:
+                bar.setUpdatesEnabled(updates_enabled)
+                bar.update()
+            self._schedule_tab_scroll_restore()
+
+    def _schedule_tab_scroll_restore(self):
+        # Qt 会在 setCurrentWidget/addTab/removeTab 后再次确保当前 tab 可见；
+        # 延迟恢复几次，最终让标签栏停在用户手动滚动到的位置。
+        for delay in (0, 40, 120):
+            QTimer.singleShot(delay, self._restore_tab_scroll_anchor)
 
     def _current_scroll_offset(self):
         bar = self.tabs.tabBar()
@@ -6686,6 +6880,8 @@ class AnnotationWorkspacePage(QWidget):
         if count == 0:
             return
         anchor = min(max(0, self._tab_scroll_anchor), count - 1)
+        previous_lock = self._tab_scroll_lock
+        self._tab_scroll_lock = True
         # region agent log
         _agent_debug_log(
             hypothesisId="H6",
@@ -6701,32 +6897,35 @@ class AnnotationWorkspacePage(QWidget):
             },
         )
         # endregion
-        self._apply_scroll_offset(self._tab_scroll_offset)
-        left, right = self._tab_scroll_buttons()
-        first, last = self._tab_visible_range()
-        guard = 0
-        while anchor < first and left and left.isEnabled() and guard < 200:
-            left.click()
-            QApplication.processEvents()
+        try:
+            self._apply_scroll_offset(self._tab_scroll_offset)
+            left, right = self._tab_scroll_buttons()
             first, last = self._tab_visible_range()
-            guard += 1
-        while anchor > last and right and right.isEnabled() and guard < 400:
-            right.click()
-            QApplication.processEvents()
-            first, last = self._tab_visible_range()
-            guard += 1
-        # region agent log
-        _agent_debug_log(
-            hypothesisId="H6",
-            location="screenshot_tool.py:AnnotationWorkspacePage._restore_tab_scroll_anchor",
-            message="restore tab scroll anchor end",
-            data={
-                "offset_now": self._current_scroll_offset(),
-                "visible_range": self._tab_visible_range(),
-                "guard": guard,
-            },
-        )
-        # endregion
+            guard = 0
+            while anchor < first and left and left.isEnabled() and guard < 200:
+                left.click()
+                QApplication.processEvents()
+                first, last = self._tab_visible_range()
+                guard += 1
+            while anchor > last and right and right.isEnabled() and guard < 400:
+                right.click()
+                QApplication.processEvents()
+                first, last = self._tab_visible_range()
+                guard += 1
+            # region agent log
+            _agent_debug_log(
+                hypothesisId="H6",
+                location="screenshot_tool.py:AnnotationWorkspacePage._restore_tab_scroll_anchor",
+                message="restore tab scroll anchor end",
+                data={
+                    "offset_now": self._current_scroll_offset(),
+                    "visible_range": self._tab_visible_range(),
+                    "guard": guard,
+                },
+            )
+            # endregion
+        finally:
+            self._tab_scroll_lock = previous_lock
 
     def eventFilter(self, obj, event):
         if obj in (self.tabs.tabBar(),) or obj in self._tab_scroll_buttons():
@@ -6740,7 +6939,7 @@ class AnnotationWorkspacePage(QWidget):
         return super().eventFilter(obj, event)
 
     def add_capture(self, pixmap: QPixmap, save_dir: str, initial_zoom=1.0):
-        self._create_tab(pixmap, save_dir, initial_zoom=initial_zoom)
+        return self._create_tab(pixmap, save_dir, initial_zoom=initial_zoom)
 
     def open_image_files(self, file_paths):
         invalid = []
@@ -6772,7 +6971,6 @@ class AnnotationWorkspacePage(QWidget):
             self.tabs.removeTab(index)
             self._remember_active_tab(self.tabs.currentIndex())
         self._install_tab_scroll_button_filters()
-        QTimer.singleShot(0, self._restore_tab_scroll_anchor)
         self._update_hint_visibility()
 
     def maybe_close_all(self):
@@ -6834,7 +7032,6 @@ class AnnotationWorkspacePage(QWidget):
 
         self._update_hint_visibility()
         self._install_tab_scroll_button_filters()
-        QTimer.singleShot(0, self._restore_tab_scroll_anchor)
 
     def _create_tab(self, pixmap, save_dir, source_path=None, initial_zoom=1.0):
         tab = AnnotationTab(
@@ -6866,7 +7063,6 @@ class AnnotationWorkspacePage(QWidget):
         self._install_tab_scroll_button_filters()
         # 新标签页默认选择标注框工具
         tab._set_tool(Tool.RECTANGLE)
-        QTimer.singleShot(0, self._restore_tab_scroll_anchor)
         self._update_hint_visibility()
         # region agent log
         try:
@@ -6882,6 +7078,7 @@ class AnnotationWorkspacePage(QWidget):
             data={"focus_widget": focus_name, "focus_obj_name": focus_obj_name},
         )
         # endregion
+        return tab
 
     def _bind_tab_signals(self, tab):
         tab.dirtyStateChanged.connect(lambda dirty, t=tab: self._update_tab_color(t, dirty))
@@ -7322,6 +7519,7 @@ class ScreenSnapApp(QMainWindow):
         self._update_ai_feature_state()
         self.tray_icon = None
         self._tray_message_shown = False
+        self._suppress_next_tray_message = bool(start_minimized)
         self._closing_via_tray_exit = False
         self._setup_tray_icon()
         self._sync_autostart_entry()
@@ -7377,16 +7575,24 @@ class ScreenSnapApp(QMainWindow):
             return
         base = [
             "QToolBar#PrimaryNav { background: #050a1c; border: none; padding: 8px 14px; }",
-            "QToolBar#PrimaryNav QToolButton { border-radius: 6px; padding: 4px 14px; font-weight:600; margin-right: 6px; color: #f7f8ff; background: rgba(255,255,255,0.08); }",
+            "QToolBar#PrimaryNav QToolButton { border-radius: 6px; padding: 4px 14px; font-weight:600; margin-right: 6px; color: #f7f8ff; background: rgba(255,255,255,0.08); border:1px solid transparent; }",
+            "QToolBar#PrimaryNav QToolButton:hover { background: rgba(255,255,255,0.18); border-color: rgba(255,255,255,0.35); }",
+            "QToolBar#PrimaryNav QToolButton:pressed { background: rgba(255,255,255,0.26); color: #ffffff; border-color: rgba(255,255,255,0.55); }",
             "QToolBar#PrimaryNav QToolButton:checked { color: #0a101d; }",
         ]
         for key, accent in getattr(self, "nav_color_map", {}).items():
             accent_color = QColor(accent)
             soft = accent_color.lighter(180).name()
+            hover = accent_color.lighter(150).name()
+            pressed = accent_color.darker(105).name()
             base.append(f"QToolBar#PrimaryNav QToolButton#Nav_{key} {{ background: {soft}; color:#0f1527; }}")
+            base.append(f"QToolBar#PrimaryNav QToolButton#Nav_{key}:hover {{ background: {hover}; border-color:#ffffff; color:#050a12; }}")
+            base.append(f"QToolBar#PrimaryNav QToolButton#Nav_{key}:pressed {{ background: {pressed}; border-color:#ffffff; color:#ffffff; }}")
             base.append(f"QToolBar#PrimaryNav QToolButton#Nav_{key}:checked {{ background: {accent}; color:#050a12; }}")
+            base.append(f"QToolBar#PrimaryNav QToolButton#Nav_{key}:checked:hover {{ background: {hover}; border-color:#ffffff; color:#050a12; }}")
         base.append("QToolBar#PrimaryNav QToolButton#Nav_exit { background: transparent; border:1px solid rgba(255,255,255,0.25); color:#f5f6ff; }")
         base.append("QToolBar#PrimaryNav QToolButton#Nav_exit:hover { background: rgba(255,255,255,0.15); }")
+        base.append("QToolBar#PrimaryNav QToolButton#Nav_exit:pressed { background: rgba(248,113,113,0.28); border-color:#f87171; color:#ffffff; }")
         self.nav_toolbar.setStyleSheet("".join(base))
 
     def _resolved_save_dir(self):
@@ -7595,11 +7801,13 @@ class ScreenSnapApp(QMainWindow):
     def _handle_annotation_capture(self, pixmap: QPixmap, selection_rect: QRect, screen_name: str):
         self._last_selection_rect = QRect(selection_rect)
         self._last_capture_screen_name = screen_name
-        self.workspace_page.add_capture(pixmap, self._resolved_save_dir(), self.workspace_zoom)
+        tab = self.workspace_page.add_capture(pixmap, self._resolved_save_dir(), self.workspace_zoom)
         self.home_page.set_repeat_enabled(True)
         self._focus_workspace()
         self._resize_for_image(pixmap.size())
         _set_clipboard_pixmap_with_retry(pixmap)
+        if tab and hasattr(tab, "_show_feedback"):
+            tab._show_feedback("截图完成，已添加到工作台并复制到剪贴板")
         # region agent log
         # H4: "区域截图后直接 Ctrl+V"走 setPixmap，记录以对照 PPT 报错概率
         _agent_debug_log(
@@ -7857,10 +8065,12 @@ class ScreenSnapApp(QMainWindow):
             return
         screenshot = self._grab_screen_pixmap(screen)
         cropped = self._copy_from_pixmap(screenshot, rect, screen)
-        self.workspace_page.add_capture(cropped, self._resolved_save_dir(), self.workspace_zoom)
+        tab = self.workspace_page.add_capture(cropped, self._resolved_save_dir(), self.workspace_zoom)
         self._focus_workspace()
         self._resize_for_image(cropped.size())
         _set_clipboard_pixmap_with_retry(cropped)
+        if tab and hasattr(tab, "_show_feedback"):
+            tab._show_feedback("重复截图完成，已添加到工作台并复制到剪贴板")
         # region agent log
         # H4: “重复截图后直接 Ctrl+V”走 setPixmap，记录路径以区分 MIME 写法 vs Pixmap 写法
         _agent_debug_log(
@@ -7970,7 +8180,9 @@ class ScreenSnapApp(QMainWindow):
             self.hide()
             return
         self.tray_icon.show()
-        if not self._tray_message_shown:
+        if self._suppress_next_tray_message:
+            self._suppress_next_tray_message = False
+        elif not self._tray_message_shown:
             self.tray_icon.showMessage("CTK Snapshot", "程序已最小化到系统托盘", QSystemTrayIcon.Information, 3000)
             self._tray_message_shown = True
         self.hide()
