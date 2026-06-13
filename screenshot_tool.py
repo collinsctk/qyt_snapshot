@@ -6720,6 +6720,8 @@ class AnnotationWorkspacePage(QWidget):
     def _on_tab_switched(self, index):
         self._remember_active_tab(index)
         self._apply_shared_tool_to_tab()
+        if not self._tab_scroll_lock:
+            self._schedule_current_tab_visible(index)
         # 移除切换标签时的自动锚点更新逻辑，让位置保持在用户手动滚动的地方
         # if not self._tab_scroll_lock:
         #    self._tab_scroll_last_cause = "tab_switched"
@@ -6805,6 +6807,44 @@ class AnnotationWorkspacePage(QWidget):
         # 延迟恢复几次，最终让标签栏停在用户手动滚动到的位置。
         for delay in (0, 40, 120):
             QTimer.singleShot(delay, self._restore_tab_scroll_anchor)
+        QTimer.singleShot(160, self._ensure_tab_visible)
+
+    def _ensure_tab_visible(self, index=None):
+        count = self.tabs.count()
+        if count == 0:
+            return
+        try:
+            target = self.tabs.currentIndex() if index is None else int(index)
+        except (TypeError, ValueError):
+            target = self.tabs.currentIndex()
+        target = max(0, min(target, count - 1))
+        previous_lock = self._tab_scroll_lock
+        self._tab_scroll_lock = True
+        try:
+            bar = self.tabs.tabBar()
+            left, right = self._tab_scroll_buttons()
+            guard = 0
+            while guard < 400:
+                rect = bar.tabRect(target)
+                if rect.left() >= 0 and rect.right() <= bar.width():
+                    break
+                if rect.left() < 0 and left and left.isEnabled():
+                    left.click()
+                elif rect.right() > bar.width() and right and right.isEnabled():
+                    right.click()
+                else:
+                    break
+                QApplication.processEvents()
+                guard += 1
+        finally:
+            self._tab_scroll_lock = previous_lock
+        if not self._tab_scroll_lock:
+            self._tab_scroll_last_cause = "ensure_current_visible"
+            self._update_tab_scroll_anchor()
+
+    def _schedule_current_tab_visible(self, index=None):
+        for delay in (0, 40, 120):
+            QTimer.singleShot(delay, lambda idx=index: self._ensure_tab_visible(idx))
 
     def _current_scroll_offset(self):
         bar = self.tabs.tabBar()
@@ -7050,20 +7090,20 @@ class AnnotationWorkspacePage(QWidget):
         short_label = _shorten_label(full_label, short_len)
         tab._base_label = short_label
         tab._full_label = full_label
-        with self._preserve_tab_scroll():
-            idx = self.tabs.addTab(tab, short_label)
-            if hasattr(self.tabs, "tabBar"):
-                try:
-                    self.tabs.tabBar().setTabToolTip(idx, full_label)
-                except Exception:
-                    pass
-            self._bind_tab_signals(tab)
-            self.tabs.setCurrentWidget(tab)
-            self._remember_active_tab(self.tabs.currentIndex())
+        idx = self.tabs.addTab(tab, short_label)
+        if hasattr(self.tabs, "tabBar"):
+            try:
+                self.tabs.tabBar().setTabToolTip(idx, full_label)
+            except Exception:
+                pass
+        self._bind_tab_signals(tab)
+        self.tabs.setCurrentWidget(tab)
+        self._remember_active_tab(self.tabs.currentIndex())
         self._install_tab_scroll_button_filters()
         # 新标签页默认选择标注框工具
         tab._set_tool(Tool.RECTANGLE)
         self._update_hint_visibility()
+        self._schedule_current_tab_visible(idx)
         # region agent log
         try:
             focus_widget = QApplication.focusWidget()
