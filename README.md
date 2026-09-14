@@ -36,11 +36,12 @@ CTK Snapshot 目前仅支持 Windows 环境（依赖 `winreg`、`ctypes.windll` 
 ## 打包为 EXE（可选）
 若需要分发给未安装 Python 的同事，可使用 PyInstaller：
 ```bash
-pyinstaller --onefile --noconsole --icon=favicon/favicon.ico screenshot_tool.py
+pyinstaller screenshot_tool.spec
 ```
-生成的可执行文件位于 `dist/` 目录，已带自定义图标。如需额外静态资源，可在 `screenshot_tool.spec` 中配置。
+生成的可执行文件位于 `dist/` 目录，已带自定义图标。此配置会同时打包 `favicon/` 中的窗口和托盘图标资源。
 
 ## 常见问题
+- **任务栏与托盘图标**：程序使用 `favicon/` 中的原图标，并在 Windows 任务栏中独立显示，避免与其他 Python 程序合并。默认关闭或最小化窗口后，同时保留任务栏及右下角托盘入口，点击任一处均可恢复窗口。若 Windows 将托盘图标折叠，可在右下角“显示隐藏的图标”中找到。移动程序目录时请一并保留 `favicon/` 文件夹；资源缺失时使用系统备用图标，开机时托盘尚未就绪也会保留任务栏入口。
 - **热键注册失败**：确认组合未被其他程序占用，必要时以管理员身份运行。
 - **配置无法保存**：检查项目目录写入权限，或修改保存路径至用户具有写权限的位置。
 - **想要 macOS 支持？** 当前版本深度依赖 Win32 API，尚无跨平台实现，欢迎提交 Issue 讨论需求。

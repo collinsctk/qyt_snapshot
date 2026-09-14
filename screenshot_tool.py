@@ -139,6 +139,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QFormLayout,
     QSplitter,
+    QStyle,
 )
 
 
@@ -171,7 +172,7 @@ LEGACY_USER_CONFIG_FILE = os.path.join(BASE_DIR, "user.json")
 USER_CONFIG_FILE = os.path.join(USER_DATA_DIR, "user.json")
 DEFAULT_SAVE_DIR = os.path.join(USER_DATA_DIR, "screenshots")
 LOG_FILE = os.path.join(USER_DATA_DIR, "snapshot.log")
-ICON_PATH = os.path.join(RESOURCE_DIR, "favicon", "favicon.ico")
+APP_USER_MODEL_ID = "CTK.Snapshot"
 _APP_ICON = None
 CLASSIC_COLORS = [
     "#FF6B6B",
@@ -1195,13 +1196,47 @@ class GlobalHotkeyManager:
             self._window._on_hotkey_trigger(action_id)
 
 
+def _set_taskbar_app_id():
+    """让 Windows 使用截图程序自己的任务栏分组，而不是 Python 的默认分组。"""
+    if sys.platform != "win32":
+        return
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        set_app_id = shell32.SetCurrentProcessExplicitAppUserModelID
+        set_app_id.argtypes = (wintypes.LPCWSTR,)
+        set_app_id.restype = ctypes.c_long
+        result = set_app_id(APP_USER_MODEL_ID)
+        if result != 0:
+            logging.warning("Unable to set taskbar application ID: HRESULT=%s", result)
+    except (AttributeError, OSError) as exc:
+        logging.warning("Unable to set taskbar application ID: %s", exc)
+
+
 def get_app_icon():
     global _APP_ICON
     if _APP_ICON is None:
-        if os.path.exists(ICON_PATH):
-            _APP_ICON = QIcon(ICON_PATH)
-        else:  # pragma: no cover - fallback branch
-            _APP_ICON = QIcon()
+        # 相对当前程序定位资源，兼容移动目录和打包运行，不依赖启动目录。
+        resource_dirs = [RESOURCE_DIR, BASE_DIR]
+        if getattr(sys, "frozen", False):
+            resource_dirs.append(os.path.dirname(sys.executable))
+        for resource_dir in dict.fromkeys(resource_dirs):
+            icon_dir = os.path.join(resource_dir, "favicon")
+            icon = QIcon()
+            # 沿用原图标的多尺寸 PNG，避免高 DPI 下放大唯一的 16px ICO。
+            for size in (16, 32, 48, 64, 128, 180, 192, 256, 512):
+                pixmap = QPixmap(os.path.join(icon_dir, f"favicon-{size}x{size}.png"))
+                if not pixmap.isNull():
+                    icon.addPixmap(pixmap)
+            if icon.isNull():
+                icon = QIcon(os.path.join(icon_dir, "favicon.ico"))
+            # QIcon 对损坏文件也可能返回非空对象，必须验证实际解码结果。
+            if not icon.pixmap(32, 32).isNull():
+                _APP_ICON = icon
+                logging.info("Application icon loaded from %s", icon_dir)
+                break
+        if _APP_ICON is None:
+            logging.warning("Application icon resources unavailable; using standard icon")
+            _APP_ICON = QApplication.style().standardIcon(QStyle.SP_ComputerIcon)
     return _APP_ICON
 
 
@@ -1400,7 +1435,7 @@ class GeneralSettingsPage(QWidget):
         close_desc.setWordWrap(True)
         close_group_layout.addWidget(close_desc)
 
-        self.close_tray_radio = QRadioButton(u"\u6700\u5c0f\u5316\u5230\u7cfb\u7edf\u6258\u76d8\uff08\u9ed8\u8ba4\uff09")
+        self.close_tray_radio = QRadioButton("最小化并保留任务栏及托盘图标（默认）")
         self.close_exit_radio = QRadioButton(u"\u76f4\u63a5\u9000\u51fa\u7a0b\u5e8f")
         close_group_layout.addWidget(self.close_tray_radio)
         close_group_layout.addWidget(self.close_exit_radio)
@@ -8128,8 +8163,6 @@ class ScreenSnapApp(QMainWindow):
             return
         behavior = self.close_behavior
         tray_available = bool(self.tray_icon and QSystemTrayIcon.isSystemTrayAvailable())
-        if behavior == "tray" and not tray_available:
-            behavior = "exit"
         if self._closing_via_tray_exit:
             behavior = "exit"
         if getattr(self, "_force_exit_once", False):
@@ -8199,12 +8232,13 @@ class ScreenSnapApp(QMainWindow):
         return
 
     def _setup_tray_icon(self):
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            self.tray_icon = None
+        if self.tray_icon is not None:
+            self.tray_icon.show()
             return
+        # 开机时托盘可能还未就绪；保持可见请求，让 Qt 在托盘就绪后补建图标。
         self.tray_icon = QSystemTrayIcon(get_app_icon(), self)
         self.tray_icon.setToolTip("CTK Snapshot")
-        tray_menu = QMenu()
+        tray_menu = QMenu(self)
         restore_action = QAction("显示窗口", self)
         exit_action = QAction("退出", self)
         tray_menu.addAction(restore_action)
@@ -8213,25 +8247,33 @@ class ScreenSnapApp(QMainWindow):
         exit_action.triggered.connect(self._exit_from_tray)
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self._on_tray_icon_activated)
-        self.tray_icon.hide()
+        self.tray_icon.show()
 
     def _minimize_to_tray(self):
-        if not self.tray_icon:
-            self.hide()
-            return
+        if self.tray_icon is None:
+            self._setup_tray_icon()
         self.tray_icon.show()
+        if (not QSystemTrayIcon.isSystemTrayAvailable()
+                or self.tray_icon.icon().pixmap(32, 32).isNull()):
+            # 没有可用托盘时保留任务栏入口，避免窗口和托盘同时消失。
+            self.showMinimized()
+            logging.warning("System tray unavailable; window minimized to taskbar")
+            return
         if self._suppress_next_tray_message:
             self._suppress_next_tray_message = False
         elif not self._tray_message_shown:
-            self.tray_icon.showMessage("CTK Snapshot", "程序已最小化到系统托盘", QSystemTrayIcon.Information, 3000)
+            self.tray_icon.showMessage("CTK Snapshot", "程序已最小化，可从任务栏或系统托盘恢复", QSystemTrayIcon.Information, 3000)
             self._tray_message_shown = True
-        self.hide()
-        logging.info("Window minimized to tray")
+        self.showMinimized()
+        logging.info("Window minimized; taskbar and tray icons retained")
 
     def _restore_from_tray(self):
         if self.tray_icon:
-            self.tray_icon.hide()
-        self.show()
+            self.tray_icon.show()
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
         self.raise_()
         self.activateWindow()
 
@@ -8241,8 +8283,6 @@ class ScreenSnapApp(QMainWindow):
 
     def _exit_from_tray(self):
         self._closing_via_tray_exit = True
-        if self.tray_icon:
-            self.tray_icon.hide()
         logging.info("Exit triggered from tray menu")
         self.close()
 
@@ -8354,6 +8394,7 @@ class ScreenSnapApp(QMainWindow):
 
 def main():
     _setup_logging()
+    _set_taskbar_app_id()
     logging.info("Starting Snapshot app with args: %s", sys.argv)
     _ensure_qt_plugins_path()
     guard = SingleInstanceGuard()

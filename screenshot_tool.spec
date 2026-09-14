@@ -5,7 +5,7 @@ a = Analysis(
     ['screenshot_tool.py'],
     pathex=[],
     binaries=[],
-    datas=[('favicon\\favicon.ico', 'favicon')],
+    datas=[('favicon', 'favicon')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
